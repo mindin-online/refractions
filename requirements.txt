@@ -1,0 +1,19 @@
+cdp-sdk==1.47.0
+python-dotenv
+requests
+pyjwt
+cryptography
+aiohttp
+web3
+pydantic>=2.10.3
+alpaca-py>=0.20.0
+# cache bust v4
+fastapi
+uvicorn[standard]
+python-multipart
+redis>=4.0.0
+discord.py>=2.3.0
+web3
+redis
+requests
+cdp-sdk
