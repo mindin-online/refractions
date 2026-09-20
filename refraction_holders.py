@@ -1,79 +1,114 @@
 """
-refraction_holders.py
+refraction_holders.py (v3 — free, on-chain approximation)
 
-Top-holder concentration check via GoldRush (Covalent) API. Requires a
-GoldRush API key on their ~$10/mo tier or above -- much cheaper than
-Etherscan's equivalent endpoint, which needs their $199/mo Standard plan.
+Top-holder concentration check via Transfer-event log reconstruction --
+no third-party API, no billing account to get suspended or rate-limited.
+This works well specifically because these are freshly-launched tokens
+(pulled from DexScreener's newest-profiles feed): total Transfer history
+is small enough to scan directly over a bounded recent block window,
+using the same free Base RPC everything else already uses.
 
-GoldRush's token_holders_v2 response doesn't classify holder addresses as
-contract vs EOA, so this does one extra (free) RPC call -- eth_getCode --
-on whichever address turns out to hold the most, to answer that part.
+Scans eth_getLogs for the token's Transfer events across the last
+HOLDER_SCAN_BLOCK_WINDOW blocks (default 50,000 -- roughly a day and a
+half at Base's ~2s block time), chunked to stay within public RPC log
+range limits, and reconstructs approximate balances by tallying
+transfers in/out. This is bounded by the scan window -- if a token is
+older than the window or has unusually heavy transfer volume, the
+result comes back flagged "approximate" rather than silently guessed at.
 
-Page size is fixed at 100 by the API (their only two supported values are
-100 and 1000); for a freshly-launched token this is very likely the
-complete holder list. The code takes the max balance across whatever
-comes back rather than trusting item order, so it's correct even if the
-API's sort order isn't strictly descending by balance.
-
-Note: Covalent's v1 API has historically wrapped responses in a top-level
-{"data": {...}, "error": ...} envelope, but the current OpenAPI doc for
-this specific endpoint documents the payload without that wrapper. The
-parsing below handles either shape defensively -- if you see "no holder
-data returned" on a token you know has holders, print the raw response
-once to check which shape you're actually getting back.
+Same function signature and return contract as the previous
+provider-based versions, so this is a drop-in replacement -- no changes
+needed in refraction_check.py.
 """
 import os
-import requests
 from web3 import Web3
 
-GOLDRUSH_API_KEY = os.environ.get("GOLDRUSH_API_KEY", "")
-GOLDRUSH_URL_TEMPLATE = "https://api.covalenthq.com/v1/base-mainnet/tokens/{}/token_holders_v2/"
+BLOCK_WINDOW = int(os.environ.get("HOLDER_SCAN_BLOCK_WINDOW", "50000"))
+CHUNK_SIZE = int(os.environ.get("HOLDER_SCAN_CHUNK_SIZE", "2000"))
+MAX_LOGS = int(os.environ.get("HOLDER_SCAN_MAX_LOGS", "20000"))  # safety cap
+
+TRANSFER_TOPIC = "0x" + bytes(Web3.keccak(text="Transfer(address,address,uint256)")).hex()
+
+ERC20_MINIMAL_ABI = [
+    {"inputs": [], "name": "totalSupply", "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
+]
+
+ZERO_ADDRESS = Web3.to_checksum_address("0x0000000000000000000000000000000000000000")
 
 
-def get_holder_concentration(w3: Web3, token_address: str) -> dict:
+def _fetch_transfer_logs(w3, token_address: str):
+    latest = w3.eth.block_number
+    from_block = max(0, latest - BLOCK_WINDOW)
+    logs = []
+    any_chunk_succeeded = False
+    start = from_block
+    while start <= latest:
+        end = min(start + CHUNK_SIZE - 1, latest)
+        try:
+            chunk_logs = w3.eth.get_logs({
+                "address": token_address,
+                "topics": [TRANSFER_TOPIC],
+                "fromBlock": start,
+                "toBlock": end,
+            })
+            logs.extend(chunk_logs)
+            any_chunk_succeeded = True
+        except Exception:
+            pass  # skip chunk on RPC error (range limits, timeouts) -- best-effort
+        if len(logs) > MAX_LOGS:
+            return logs, False, any_chunk_succeeded  # too much volume, bail -- incomplete
+        start = end + 1
+    return logs, True, any_chunk_succeeded
+
+
+def get_holder_concentration(w3, token_address: str) -> dict:
     """
     Returns:
       ok=True:  {"ok": True, "top_holder_address": str,
-                 "top_holder_is_contract": bool, "top_holder_pct": float}
+                 "top_holder_is_contract": bool, "top_holder_pct": float,
+                 "approximate": bool}  # True if the scan window was hit
+                                        # before covering full history
       ok=False: {"ok": False, "reason": str}
     """
-    if not GOLDRUSH_API_KEY:
-        return {"ok": False, "reason": "GOLDRUSH_API_KEY not set"}
-
     target = Web3.to_checksum_address(token_address)
 
     try:
-        resp = requests.get(
-            GOLDRUSH_URL_TEMPLATE.format(target),
-            params={"key": GOLDRUSH_API_KEY, "page-size": 100, "page-number": 0},
-            timeout=20,
-        )
-        if not resp.ok:
-            return {"ok": False, "reason": f"token_holders_v2 HTTP {resp.status_code}: {resp.text[:300]}"}
-        raw = resp.json()
+        contract = w3.eth.contract(address=target, abi=ERC20_MINIMAL_ABI)
+        total_supply_raw = contract.functions.totalSupply().call()
     except Exception as e:
-        return {"ok": False, "reason": f"token_holders_v2 request failed: {e}"}
+        return {"ok": False, "reason": f"totalSupply call failed: {e}"}
 
-    if raw.get("error"):
-        return {"ok": False, "reason": raw.get("error_message", "GoldRush API error")}
-
-    payload = raw.get("data", raw)  # handle wrapped or unwrapped response shape
-    items = payload.get("items") or []
-    if not items:
-        return {"ok": False, "reason": "no holder data returned"}
-
-    try:
-        top = max(items, key=lambda i: int(i["balance"]))
-        total_supply = int(top["total_supply"])
-        top_balance = int(top["balance"])
-    except (KeyError, ValueError, TypeError) as e:
-        return {"ok": False, "reason": f"unexpected response shape: {e}"}
-
-    if total_supply <= 0:
+    if total_supply_raw <= 0:
         return {"ok": False, "reason": "total supply is zero"}
 
-    pct = (top_balance / total_supply) * 100
-    top_address = Web3.to_checksum_address(top["address"])
+    logs, complete, any_chunk_succeeded = _fetch_transfer_logs(w3, target)
+
+    if not logs:
+        if not any_chunk_succeeded:
+            return {"ok": False, "reason": "could not fetch transfer logs from RPC (all chunk requests failed -- check RPC_URL / rate limits)"}
+        return {"ok": False, "reason": "no Transfer events found in scan window"}
+
+    balances = {}
+    for log in logs:
+        try:
+            from_addr = Web3.to_checksum_address("0x" + bytes(log["topics"][1])[-20:].hex())
+            to_addr = Web3.to_checksum_address("0x" + bytes(log["topics"][2])[-20:].hex())
+            amount = int.from_bytes(bytes(log["data"]), "big")
+        except Exception:
+            continue
+        if from_addr != ZERO_ADDRESS:
+            balances[from_addr] = balances.get(from_addr, 0) - amount
+        if to_addr != ZERO_ADDRESS:
+            balances[to_addr] = balances.get(to_addr, 0) + amount
+
+    if not balances:
+        return {"ok": False, "reason": "could not reconstruct any balances from logs"}
+
+    top_address, top_balance = max(balances.items(), key=lambda kv: kv[1])
+    if top_balance <= 0:
+        return {"ok": False, "reason": "reconstructed top balance is zero or negative -- scan window likely incomplete"}
+
+    pct = (top_balance / total_supply_raw) * 100
 
     try:
         is_contract = len(w3.eth.get_code(top_address)) > 0
@@ -85,4 +120,5 @@ def get_holder_concentration(w3: Web3, token_address: str) -> dict:
         "top_holder_address": top_address,
         "top_holder_is_contract": is_contract,
         "top_holder_pct": pct,
+        "approximate": not complete,
     }
