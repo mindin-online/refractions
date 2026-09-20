@@ -20,17 +20,19 @@ Env vars specific to this file:
 See refraction_check.py for the REFRACTION_REQUIRE_* / REFRACTION_*_PCT
 env vars that control which pipeline steps gate a buy.
 
-Requires base_buy.py to expose a callable (not just CLI-guarded) function:
+Requires base_buy.py to expose an async callable:
 
-    def execute_buy(token_address: str, usd_amount: float) -> dict:
-        # ...your existing account.swap(AccountSwapOptions(...)) logic...
+    async def execute_buy(token_address: str, usd_amount: float) -> dict:
+        ...
         return {"tx_hash": "0x...", "status": "..."}
 
-If that import fails, the scanner still runs and alerts on passes, it
-just skips the buy step and says so in the Discord message.
+Confirmed as of the real base_buy.py source: this is genuinely async
+(uses the CDP SDK's async CdpClient), so this file calls it via
+asyncio.run() from the otherwise-synchronous scan loop.
 """
 import os
 import time
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -191,7 +193,7 @@ def process_candidate(token_address: str):
         return
 
     try:
-        buy_result = execute_buy(token_address, BUY_USD)
+        buy_result = asyncio.run(execute_buy(token_address, BUY_USD))
         increment_daily_count()
         notify_all(
             f"✅ Bought ${BUY_USD:.0f} of `{token_address}` (liquidity ${liquidity:,.0f}). "
