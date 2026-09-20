@@ -1,4 +1,6 @@
-"""  # v2.0 USDC support
+"""  # v2.1 — added execute_buy() for automated callers; CLI arg-parsing
+# moved under __main__ so the module is safely importable (previously it
+# ran at module scope and would sys.exit(1) on import with no argv).
 base_buy.py — Manual DEX Buy Tool (Base Chain)
 Supports ETH and USDC pools. Auto-detects quote token.
 
@@ -8,6 +10,11 @@ Usage:
   python base_buy.py SYMBOL 50%          # 50% of wallet ETH
   python base_buy.py 0xCONTRACT         # buy by contract address
   python base_buy.py 0xCONTRACT 0.02   # buy contract with amount
+
+Programmatic usage (e.g. from refraction_scanner.py):
+  import asyncio
+  from base_buy import execute_buy
+  result = asyncio.run(execute_buy(token_address, usd_amount))
 """
 import os, sys, asyncio, logging, smtplib, requests
 from datetime import datetime, timezone
@@ -59,26 +66,6 @@ def tg_send(msg):
     if _tg:
         try: _tg.send(msg)
         except Exception: pass
-
-# ── Args ──────────────────────────────────────────────────────────────────────
-args = sys.argv[1:]
-if not args:
-    print("Usage: base_buy.py SYMBOL_OR_CONTRACT [eth_amount_or_%]")
-    sys.exit(1)
-
-RAW_ARG     = args[0]
-BUY_CONTRACT = RAW_ARG if (RAW_ARG.startswith("0x") and len(RAW_ARG) == 42) else None
-SYMBOL       = RAW_ARG if BUY_CONTRACT else RAW_ARG.upper()
-
-BUY_ETH = DEFAULT_ETH
-BUY_PCT = None
-if len(args) > 1:
-    amt = args[1]
-    if amt.endswith("%"):
-        BUY_PCT = float(amt[:-1])
-        BUY_ETH = None
-    else:
-        BUY_ETH = float(amt)
 
 # ── DexScreener ───────────────────────────────────────────────────────────────
 def search_pools(symbol: str = None, contract: str = None) -> list:
@@ -147,22 +134,96 @@ def select_best_pool(pools: list, bypass_liq: bool = False) -> dict | None:
     return None
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-async def main():
-    global BUY_ETH
+# ── Automated entry point (NEW — used by refraction_scanner.py etc.) ────────
+async def execute_buy(token_address: str, usd_amount: float) -> dict:
+    """
+    Programmatic buy entry point for automated callers. USD-denominated,
+    unlike the CLI tool (which is ETH/percentage-denominated) -- this is
+    an additive code path, it doesn't touch main() or any CLI parsing.
 
+    Auto-detects the pool's quote currency the same way the CLI does
+    (search_pools + select_best_pool), uses wallet_funding.ensure_funded()
+    to convert currencies first if the wallet's short on whichever side
+    is needed, then executes the buy with the same create_swap_quote()
+    pattern the CLI path uses.
+
+    Returns: {"tx_hash": str, "tokens_received": float, "spend_usd": float}
+    Raises RuntimeError on failure -- callers should catch it.
+    """
+    from cdp import CdpClient
+    from cdp.actions.evm.swap.create_swap_quote import create_swap_quote
+    from wallet_funding import ensure_funded
+
+    pools = search_pools(contract=token_address)
+    pool = select_best_pool(pools, bypass_liq=True)  # caller already checked liquidity
+    if not pool:
+        raise RuntimeError(f"no pool found for {token_address}")
+
+    symbol = pool["token_symbol"]
+    use_usdc = pool.get("use_usdc", False)
+    eth_usd = get_eth_usd_price()
+
+    key_id      = os.getenv("CDP_API_KEY_ID", "")
+    key_sec     = os.getenv("CDP_API_KEY_SECRET", "")
+    wal_sec     = os.getenv("CDP_WALLET_SECRET", "")
+    wallet_addr = os.getenv("BASE_SNIPER_WALLET_ADDRESS", "")
+
+    async with CdpClient(api_key_id=key_id, api_key_secret=key_sec, wallet_secret=wal_sec) as cdp:
+        needed_currency = "USDC" if use_usdc else "ETH"
+        funding = await ensure_funded(cdp.api_clients, wallet_addr, needed_currency, usd_amount, eth_usd)
+        if not funding["ok"]:
+            raise RuntimeError(f"funding check failed: {funding['reason']}")
+
+        if use_usdc:
+            from_amount = str(int(usd_amount * 10 ** USDC_DECIMALS))
+            from_token  = USDC_BASE
+        else:
+            eth_amount  = usd_amount / eth_usd
+            from_amount = str(int(eth_amount * 1e18))
+            from_token  = ETH_NATIVE
+
+        swap_quote = await create_swap_quote(
+            api_clients=cdp.api_clients,
+            from_token=from_token,
+            to_token=token_address,
+            from_amount=from_amount,
+            network="base",
+            taker=wallet_addr,
+            slippage_bps=500,
+        )
+
+        if not swap_quote.liquidity_available:
+            raise RuntimeError("no liquidity available for this swap")
+
+        _result = await swap_quote.execute()
+        tx_hash = (getattr(_result, "transaction_hash", None)
+                   or getattr(_result, "tx_hash", None)
+                   or str(_result))
+
+        to_amt = int(getattr(swap_quote, "to_amount", 0) or 0)
+        tokens_received = to_amt / (10 ** 18)
+
+        log.info(f"AUTO-BUY | {symbol} | ${usd_amount:.2f} | {tokens_received:.4f} tokens | tx={tx_hash} | "
+                 f"funded_via_conversion={funding['swapped']}")
+
+        return {"tx_hash": tx_hash, "tokens_received": tokens_received, "spend_usd": usd_amount}
+
+
+# ── CLI entry point (UNCHANGED logic, just now takes params instead of
+#    reading module-level globals) ──────────────────────────────────────────
+async def main(buy_contract, input_symbol, buy_eth, buy_pct):
     # Find pool
-    if BUY_CONTRACT:
-        print(f"\n  Searching by contract: {BUY_CONTRACT}...")
-        pools = search_pools(contract=BUY_CONTRACT)
+    if buy_contract:
+        print(f"\n  Searching by contract: {buy_contract}...")
+        pools = search_pools(contract=buy_contract)
         pool  = select_best_pool(pools, bypass_liq=True)
     else:
-        print(f"\n  Searching DexScreener for: {SYMBOL}...")
-        pools = search_pools(symbol=SYMBOL)
+        print(f"\n  Searching DexScreener for: {input_symbol}...")
+        pools = search_pools(symbol=input_symbol)
         pool  = select_best_pool(pools, bypass_liq=True)  # manual buy always bypasses liq filter
 
     if not pool:
-        print(f"  No pool found for {SYMBOL or BUY_CONTRACT}")
+        print(f"  No pool found for {input_symbol or buy_contract}")
         sys.exit(1)
 
     token_address = pool["token_address"]
@@ -176,7 +237,7 @@ async def main():
     print(f"  Quote:  {'USDC' if use_usdc else 'ETH'}")
 
     # Resolve buy amount
-    if BUY_PCT is not None:
+    if buy_pct is not None:
         try:
             from cdp import CdpClient
             async with CdpClient(
@@ -189,14 +250,14 @@ async def main():
                 for bal in result.balances:
                     if bal.token.symbol == "ETH":
                         eth_bal = bal.amount.amount / 1e18
-                        BUY_ETH = round(eth_bal * (BUY_PCT / 100), 6)
-                        print(f"  Wallet: {eth_bal:.6f} ETH → buying {BUY_PCT:.0f}% = {BUY_ETH:.6f} ETH")
+                        buy_eth = round(eth_bal * (buy_pct / 100), 6)
+                        print(f"  Wallet: {eth_bal:.6f} ETH → buying {buy_pct:.0f}% = {buy_eth:.6f} ETH")
                         break
         except Exception as e:
             print(f"  Could not fetch wallet balance: {e}")
             sys.exit(1)
 
-    if not BUY_ETH or BUY_ETH <= 0:
+    if not buy_eth or buy_eth <= 0:
         print("  Invalid buy amount")
         sys.exit(1)
 
@@ -218,15 +279,15 @@ async def main():
             account = await cdp.evm.get_or_create_account(name="base-sniper")
 
             if use_usdc:
-                usdc_amount = BUY_ETH * eth_usd
+                usdc_amount = buy_eth * eth_usd
                 from_amount = str(int(usdc_amount * 10**USDC_DECIMALS))
                 from_token  = USDC_BASE
                 print(f"\n  Buying with ${usdc_amount:.2f} USDC...")
                 # CDP SDK handles Permit2 approval internally for ERC20 swaps
             else:
-                from_amount = str(int(BUY_ETH * 1e18))
+                from_amount = str(int(buy_eth * 1e18))
                 from_token  = ETH_NATIVE
-                print(f"\n  Buying with {BUY_ETH} ETH...")
+                print(f"\n  Buying with {buy_eth} ETH...")
 
             swap_quote = await create_swap_quote(
                 api_clients=cdp.api_clients,
@@ -262,7 +323,7 @@ async def main():
             # Calculate received
             to_amt          = int(getattr(swap_quote, "to_amount", 0) or 0)
             tokens_received = to_amt / (10 ** 18)
-            spend_str       = f"${usdc_amount:.2f} USDC" if use_usdc else f"{BUY_ETH:.6f} ETH (${BUY_ETH*eth_usd:.2f})"
+            spend_str       = f"${usdc_amount:.2f} USDC" if use_usdc else f"{buy_eth:.6f} ETH (${buy_eth*eth_usd:.2f})"
 
             print(f"\n  {'='*52}")
             print(f"  BUY EXECUTED")
@@ -307,4 +368,23 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    args = sys.argv[1:]
+    if not args:
+        print("Usage: base_buy.py SYMBOL_OR_CONTRACT [eth_amount_or_%]")
+        sys.exit(1)
+
+    _raw_arg      = args[0]
+    _buy_contract = _raw_arg if (_raw_arg.startswith("0x") and len(_raw_arg) == 42) else None
+    _cli_symbol   = _raw_arg if _buy_contract else _raw_arg.upper()
+
+    _buy_eth = DEFAULT_ETH
+    _buy_pct = None
+    if len(args) > 1:
+        _amt = args[1]
+        if _amt.endswith("%"):
+            _buy_pct = float(_amt[:-1])
+            _buy_eth = None
+        else:
+            _buy_eth = float(_amt)
+
+    asyncio.run(main(_buy_contract, _cli_symbol, _buy_eth, _buy_pct))
