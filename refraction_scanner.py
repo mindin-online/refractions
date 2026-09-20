@@ -93,6 +93,35 @@ def notify_discord(content: str):
         log.error("Discord webhook failed: %s", e)
 
 
+def notify_email(subject: str, body: str):
+    api_key = os.environ.get("RESEND_API_KEY")
+    to_addr = os.environ.get("REFRACTION_EMAIL_TO")
+    if not api_key or not to_addr:
+        return  # email is optional -- silently skip if not configured
+    try:
+        requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "from": os.environ.get("RESEND_FROM", "alerts@yourdomain.com"),
+                "to": [to_addr],
+                "subject": subject,
+                "text": body,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        log.error("Resend email failed: %s", e)
+
+
+def notify_all(content: str, subject: str = "Refraction scanner — pass found"):
+    """Every refraction pass goes to both channels, regardless of whether
+    a buy actually happens -- so you have a record even on days you're
+    out of funds, capped, or below the liquidity floor."""
+    notify_discord(content)
+    notify_email(subject, content)
+
+
 def fetch_new_base_profiles():
     resp = requests.get(DEXSCREENER_PROFILES_URL, timeout=15)
     resp.raise_for_status()
@@ -140,7 +169,7 @@ def process_candidate(token_address: str):
     step_summary = format_step_summary(result)
 
     if buys_today() >= MAX_BUYS_PER_DAY:
-        notify_discord(
+        notify_all(
             f"🔍 Refraction pass on `{token_address}` but daily buy cap ({MAX_BUYS_PER_DAY}) "
             f"reached — not buying.\n{step_summary}\n{dex_url}"
         )
@@ -148,14 +177,14 @@ def process_candidate(token_address: str):
 
     liquidity = get_liquidity_usd(token_address)
     if liquidity < MIN_LIQUIDITY_USD:
-        notify_discord(
+        notify_all(
             f"🔍 Refraction pass on `{token_address}` but liquidity (${liquidity:,.0f}) "
             f"below floor (${MIN_LIQUIDITY_USD:,.0f}) — not buying.\n{step_summary}\n{dex_url}"
         )
         return
 
     if execute_buy is None:
-        notify_discord(
+        notify_all(
             f"🔍 Refraction pass on `{token_address}` (liquidity ${liquidity:,.0f}) — "
             f"execute_buy not wired up yet, buy skipped.\n{step_summary}\n{dex_url}"
         )
@@ -164,13 +193,13 @@ def process_candidate(token_address: str):
     try:
         buy_result = execute_buy(token_address, BUY_USD)
         increment_daily_count()
-        notify_discord(
+        notify_all(
             f"✅ Bought ${BUY_USD:.0f} of `{token_address}` (liquidity ${liquidity:,.0f}). "
             f"tx: {buy_result.get('tx_hash', 'n/a')}\n{step_summary}\n{dex_url}"
         )
     except Exception as e:
         log.error("Buy failed for %s: %s", token_address, e)
-        notify_discord(f"⚠️ Buy failed for `{token_address}`: {e}")
+        notify_all(f"⚠️ Buy failed for `{token_address}`: {e}")
 
 
 def run():
