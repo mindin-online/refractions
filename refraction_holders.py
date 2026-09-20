@@ -48,7 +48,8 @@ def get_holder_concentration(w3: Web3, token_address: str) -> dict:
             params={"key": GOLDRUSH_API_KEY, "page-size": 100, "page-number": 0},
             timeout=20,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            return {"ok": False, "reason": f"token_holders_v2 HTTP {resp.status_code}: {resp.text[:300]}"}
         raw = resp.json()
     except Exception as e:
         return {"ok": False, "reason": f"token_holders_v2 request failed: {e}"}
