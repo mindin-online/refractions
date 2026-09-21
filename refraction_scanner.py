@@ -31,6 +31,7 @@ Confirmed as of the real base_buy.py source: this is genuinely async
 asyncio.run() from the otherwise-synchronous scan loop.
 """
 import os
+import json
 import time
 import asyncio
 import logging
@@ -63,6 +64,11 @@ r = redis.from_url(REDIS_URL, decode_responses=True)
 
 SEEN_TTL = 60 * 60 * 24 * 7  # 7 days
 DAILY_COUNT_KEY = "refraction:daily_count"
+
+LOG_LIST_KEY = "refraction:log"          # capped list of passes + near-misses, read by !rlog too
+LOG_LIST_MAX = 200
+LAST_DIGEST_KEY = "refraction:last_digest_at"
+DIGEST_INTERVAL_SECONDS = int(os.environ.get("REFRACTION_DIGEST_INTERVAL_SECONDS", str(12 * 3600)))
 
 
 def seconds_until_utc_midnight() -> int:
@@ -144,6 +150,68 @@ def get_liquidity_usd(token_address: str) -> float:
         return 0.0
 
 
+def log_candidate(token_address: str, result: dict, status: str):
+    """status is 'pass' or 'near_miss'. Read back by both the twice-daily
+    digest below and the !rlog Discord command (same Redis, different
+    service) -- capped list so it never grows unbounded."""
+    holders = result["detail"]["holders"]
+    entry = {
+        "address": token_address,
+        "timestamp": time.time(),
+        "status": status,
+        "steps": result["steps"],
+        "interface_pattern": result["detail"]["interface"].get("pattern"),
+        "holder_pct": holders.get("top_holder_pct") if holders.get("ok") else None,
+    }
+    pipe = r.pipeline()
+    pipe.rpush(LOG_LIST_KEY, json.dumps(entry))
+    pipe.ltrim(LOG_LIST_KEY, -LOG_LIST_MAX, -1)
+    pipe.execute()
+
+
+def maybe_send_digest():
+    """Fires at most once per DIGEST_INTERVAL_SECONDS (default 12h). On
+    the very first run it just records a start time rather than sending
+    an immediate (empty) digest."""
+    last = r.get(LAST_DIGEST_KEY)
+    now = time.time()
+    if last is None:
+        r.set(LAST_DIGEST_KEY, str(now))
+        return
+    last = float(last)
+    if now - last < DIGEST_INTERVAL_SECONDS:
+        return
+
+    raw_entries = r.lrange(LOG_LIST_KEY, 0, -1)
+    entries = []
+    for raw in raw_entries:
+        try:
+            e = json.loads(raw)
+            if e["timestamp"] > last:
+                entries.append(e)
+        except Exception:
+            continue
+
+    r.set(LAST_DIGEST_KEY, str(now))
+
+    if not entries:
+        notify_all("📋 Refraction digest: no passes or near-misses since the last one.",
+                    subject="Refraction digest — nothing found")
+        return
+
+    passes = [e for e in entries if e["status"] == "pass"]
+    near_misses = [e for e in entries if e["status"] == "near_miss"]
+
+    lines = [f"📋 **Refraction digest** — {len(passes)} pass(es), {len(near_misses)} near-miss(es)"]
+    for e in passes:
+        lines.append(f"✅ `{e['address']}` — {e['interface_pattern'] or '?'} pattern")
+    for e in near_misses:
+        gates_passed = [k for k, v in e["steps"].items() if v]
+        lines.append(f"🔸 `{e['address']}` — passed: {', '.join(gates_passed) or 'none'}")
+
+    notify_all("\n".join(lines), subject=f"Refraction digest — {len(passes)} pass, {len(near_misses)} near-miss")
+
+
 def format_step_summary(result: dict) -> str:
     steps = result["steps"]
     active = set(result["gates_active"])
@@ -165,9 +233,14 @@ def process_candidate(token_address: str):
     dex_url = f"https://dexscreener.com/base/{token_address}"
 
     if not result["passes_all"]:
-        return  # silent skip -- only alert on passes or on passes-but-blocked-by-cap/liquidity
+        active_gates = set(result["gates_active"])
+        required_passed = sum(1 for k in active_gates if result["steps"].get(k))
+        if required_passed >= 1:
+            log_candidate(token_address, result, "near_miss")
+        return  # no immediate alert -- near-misses surface in the twice-daily digest / !rlog instead
 
     log.info("Refraction pass: %s", token_address)
+    log_candidate(token_address, result, "pass")
     step_summary = format_step_summary(result)
 
     if buys_today() >= MAX_BUYS_PER_DAY:
@@ -211,6 +284,7 @@ def run():
         try:
             for profile in fetch_new_base_profiles():
                 process_candidate(profile["tokenAddress"])
+            maybe_send_digest()
         except Exception as e:
             log.error("Scan loop error: %s", e)
         time.sleep(POLL_INTERVAL)
