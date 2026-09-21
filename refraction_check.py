@@ -42,11 +42,29 @@ Steps:
      something every refraction token will be, so it's a bonus signal
      rather than a hard gate unless you flip it on.
 
+  5. No admin-key / mutability red flags: same bytecode-selector scan as
+     step 1, but inverted -- instead of confirming good selectors exist,
+     this checks whether common OpenZeppelin-style admin selectors exist
+     at all (owner(), renounceOwnership(), transferOwnership(address),
+     pause()/unpause(), an arbitrary mint(address,uint256), blacklist(),
+     excludeFromFee()). Presence of any of these is a red flag -- it
+     means someone can still change behavior after launch.
+
+     Real limitation, not just theoretical: this only catches the
+     standard/naive versions of these patterns. A determined rug can
+     rename the function or gate the same capability behind an
+     unrecognizable selector, and this check would show clean. Treat a
+     pass here as "no obvious admin backdoor," not "provably immutable."
+     mint(address,uint256) is deliberately distinct from ERC-4626's own
+     mint(uint256,address) in step 1 -- different argument order means a
+     different selector, so a legitimate vault's mint doesn't trip this.
+
 IMPORTANT CAVEAT (unchanged from the original version of this check):
 none of this is a securities-law determination. It confirms code shape
 and on-chain facts (interface, holder concentration, reward asset, gauge
-registration) -- not distribution history, marketing, or who actually
-controls reward funding, which is what Howey-style analysis turns on.
+registration, admin-selector presence) -- not distribution history,
+marketing, or who actually controls reward funding, which is what
+Howey-style analysis turns on.
 """
 import os
 from web3 import Web3
@@ -94,6 +112,17 @@ ERC4626_SIGNATURES = [
 
 REWARD_TOKEN_ACCESSORS = ["rewardsToken()", "rewardToken()"]
 
+ADMIN_RISK_SIGNATURES = [
+    "owner()",
+    "renounceOwnership()",
+    "transferOwnership(address)",
+    "pause()",
+    "unpause()",
+    "mint(address,uint256)",   # deliberately NOT the same selector as ERC-4626's mint(uint256,address)
+    "blacklist(address)",
+    "excludeFromFee(address)",
+]
+
 
 def _env_flag(name: str, default: str) -> bool:
     return os.environ.get(name, default) not in ("0", "false", "False", "")
@@ -103,6 +132,7 @@ REQUIRE_INTERFACE = _env_flag("REFRACTION_REQUIRE_INTERFACE", "1")
 REQUIRE_HOLDER_CONCENTRATION = _env_flag("REFRACTION_REQUIRE_HOLDER_CONCENTRATION", "1")
 REQUIRE_REWARD_TOKEN = _env_flag("REFRACTION_REQUIRE_REWARD_TOKEN", "1")
 REQUIRE_AERODROME_GAUGE = _env_flag("REFRACTION_REQUIRE_AERODROME_GAUGE", "0")
+REQUIRE_NO_ADMIN_KEYS = _env_flag("REFRACTION_REQUIRE_NO_ADMIN_KEYS", "1")
 MIN_HOLDER_PCT = float(os.environ.get("REFRACTION_MIN_HOLDER_PCT", "30"))
 MAX_HOLDER_PCT = float(os.environ.get("REFRACTION_MAX_HOLDER_PCT", "70"))
 
@@ -166,6 +196,12 @@ def _is_aerodrome_gauge(address: str) -> bool:
         return False
 
 
+def _check_admin_risk(bytecode_hex: str) -> dict:
+    matches = _match_function_set(bytecode_hex, ADMIN_RISK_SIGNATURES)
+    found = [sig for sig, present in matches.items() if present]
+    return {"no_admin_keys": len(found) == 0, "flagged_selectors": found}
+
+
 def check_refraction(address: str) -> dict:
     """
     Runs every step regardless of which are required, so you always get
@@ -180,6 +216,7 @@ def check_refraction(address: str) -> dict:
     holders = get_holder_concentration(w3, target)
     reward = _get_reward_token(logic_address)
     is_gauge = _is_aerodrome_gauge(target)
+    admin_risk = _check_admin_risk(bytecode_hex)
 
     holder_pass = (
         holders["ok"]
@@ -192,12 +229,14 @@ def check_refraction(address: str) -> dict:
         "holder_concentration_pass": holder_pass,
         "reward_token_mainstream": reward["is_mainstream"],
         "aerodrome_gauge": is_gauge,
+        "no_admin_keys": admin_risk["no_admin_keys"],
     }
     gates = {
         "interface_match": REQUIRE_INTERFACE,
         "holder_concentration_pass": REQUIRE_HOLDER_CONCENTRATION,
         "reward_token_mainstream": REQUIRE_REWARD_TOKEN,
         "aerodrome_gauge": REQUIRE_AERODROME_GAUGE,
+        "no_admin_keys": REQUIRE_NO_ADMIN_KEYS,
     }
     passes_all = all(steps[k] for k, required in gates.items() if required)
 
@@ -211,5 +250,6 @@ def check_refraction(address: str) -> dict:
             "interface": interface,
             "holders": holders,
             "reward": reward,
+            "admin_risk": admin_risk,
         },
     }
