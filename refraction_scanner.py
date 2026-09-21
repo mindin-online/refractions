@@ -70,6 +70,18 @@ LOG_LIST_MAX = 200
 LAST_DIGEST_KEY = "refraction:last_digest_at"
 DIGEST_INTERVAL_SECONDS = int(os.environ.get("REFRACTION_DIGEST_INTERVAL_SECONDS", str(12 * 3600)))
 
+# --- periodic top-1h-movers scan (Base) ---
+# DexScreener's public API has no "top movers" endpoint (checked, not
+# assumed) -- GeckoTerminal's free public API does have proper pool
+# ranking, so this uses that instead, purely for discovering *additional*
+# candidates beyond the new-token-profile stream above. Same
+# process_candidate() / same refraction pipeline either way.
+GECKOTERMINAL_POOLS_URL = "https://api.geckoterminal.com/api/v2/networks/base/pools"
+MOVER_SCAN_INTERVAL_SECONDS = int(os.environ.get("MOVER_SCAN_INTERVAL_SECONDS", str(4 * 3600)))
+MOVER_SCAN_COUNT = int(os.environ.get("MOVER_SCAN_COUNT", "30"))
+MOVER_SCAN_PAGES = int(os.environ.get("MOVER_SCAN_PAGES", "3"))
+LAST_MOVER_SCAN_KEY = "refraction:last_mover_scan_at"
+
 
 def seconds_until_utc_midnight() -> int:
     now = datetime.now(timezone.utc)
@@ -148,6 +160,76 @@ def get_liquidity_usd(token_address: str) -> float:
     except Exception as e:
         log.error("Liquidity lookup failed for %s: %s", token_address, e)
         return 0.0
+
+
+def fetch_base_top_movers(limit=30, pages=3):
+    """Pull several pages of Base pools ranked by 24h volume (Gecko's
+    only documented sort options), then rank the combined set by 1h
+    price change client-side -- there's no direct 'sort by h1 change'
+    parameter. Filters out anything below MIN_LIQUIDITY_USD before
+    ranking, so obvious low-liquidity wick noise doesn't waste RPC/API
+    calls downstream. Verify the id-parsing below against a live
+    response on first run -- written from GeckoTerminal's documented id
+    format ("base_0x...") but not tested against a real payload yet."""
+    candidates = []
+    for page in range(1, pages + 1):
+        try:
+            resp = requests.get(GECKOTERMINAL_POOLS_URL, params={
+                "sort": "h24_volume_usd_desc",
+                "page": page,
+            }, timeout=15)
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+        except Exception as e:
+            log.error("GeckoTerminal pools fetch failed (page %s): %s", page, e)
+            continue
+
+        for item in data:
+            attrs = item.get("attributes", {}) or {}
+            change_h1 = (attrs.get("price_change_percentage") or {}).get("h1")
+            liquidity = attrs.get("reserve_in_usd")
+            base_token = ((item.get("relationships") or {}).get("base_token") or {}).get("data") or {}
+            raw_id = base_token.get("id", "")
+            token_address = raw_id.split("_", 1)[1] if "_" in raw_id else None
+
+            if change_h1 is None or token_address is None:
+                continue
+            try:
+                if liquidity is not None and float(liquidity) < MIN_LIQUIDITY_USD:
+                    continue
+            except (TypeError, ValueError):
+                pass
+
+            candidates.append({"token_address": token_address, "change_h1": float(change_h1)})
+
+    candidates.sort(key=lambda c: c["change_h1"], reverse=True)
+    seen_addrs, top = set(), []
+    for c in candidates:
+        key = c["token_address"].lower()
+        if key in seen_addrs:
+            continue
+        seen_addrs.add(key)
+        top.append(c)
+        if len(top) >= limit:
+            break
+    return top
+
+
+def maybe_run_mover_scan():
+    """Fires at most once per MOVER_SCAN_INTERVAL_SECONDS (default 4h).
+    Reuses process_candidate() as-is -- same Redis 'seen' dedup applies,
+    so a token already checked via the profile-stream above won't be
+    re-checked here, and vice versa."""
+    last = r.get(LAST_MOVER_SCAN_KEY)
+    now = time.time()
+    if last is not None and now - float(last) < MOVER_SCAN_INTERVAL_SECONDS:
+        return
+    r.set(LAST_MOVER_SCAN_KEY, str(now))
+
+    log.info("Running periodic top-movers scan (Base, top %d by 1h change)", MOVER_SCAN_COUNT)
+    movers = fetch_base_top_movers(limit=MOVER_SCAN_COUNT, pages=MOVER_SCAN_PAGES)
+    for m in movers:
+        process_candidate(m["token_address"])
 
 
 def log_candidate(token_address: str, result: dict, status: str):
@@ -284,6 +366,7 @@ def run():
         try:
             for profile in fetch_new_base_profiles():
                 process_candidate(profile["tokenAddress"])
+            maybe_run_mover_scan()
             maybe_send_digest()
         except Exception as e:
             log.error("Scan loop error: %s", e)
