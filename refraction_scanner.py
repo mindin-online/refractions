@@ -41,6 +41,7 @@ import redis
 import requests
 
 from refraction_check import check_refraction
+from refraction_tax_check import check_transfer_tax
 
 try:
     from base_buy import execute_buy
@@ -55,6 +56,7 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 BUY_USD = float(os.environ.get("REFRACTION_BUY_USD", "10"))
 MAX_BUYS_PER_DAY = int(os.environ.get("REFRACTION_MAX_BUYS_PER_DAY", "3"))
 MIN_LIQUIDITY_USD = float(os.environ.get("REFRACTION_MIN_LIQUIDITY_USD", "5000"))
+REQUIRE_ZERO_TAX = os.environ.get("REFRACTION_REQUIRE_ZERO_TAX", "1") not in ("0", "false", "False", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "120"))
 
 DEXSCREENER_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
@@ -149,17 +151,24 @@ def fetch_new_base_profiles():
     return [p for p in data if p.get("chainId") == "base" and p.get("tokenAddress")]
 
 
-def get_liquidity_usd(token_address: str) -> float:
+def get_pool_info(token_address: str) -> dict:
+    """Returns {'liquidity_usd': float, 'pool_address': str|None} for the
+    deepest pair -- the pool address is needed by the tax check (it holds
+    a real token balance to simulate a transfer from)."""
     try:
         resp = requests.get(DEXSCREENER_PAIRS_URL.format(token_address), timeout=15)
         resp.raise_for_status()
         pairs = resp.json()
         if not pairs:
-            return 0.0
-        return max((p.get("liquidity", {}).get("usd", 0) or 0) for p in pairs)
+            return {"liquidity_usd": 0.0, "pool_address": None}
+        best = max(pairs, key=lambda p: (p.get("liquidity", {}) or {}).get("usd", 0) or 0)
+        return {
+            "liquidity_usd": (best.get("liquidity", {}) or {}).get("usd", 0) or 0,
+            "pool_address": best.get("pairAddress"),
+        }
     except Exception as e:
-        log.error("Liquidity lookup failed for %s: %s", token_address, e)
-        return 0.0
+        log.error("Pool info lookup failed for %s: %s", token_address, e)
+        return {"liquidity_usd": 0.0, "pool_address": None}
 
 
 def fetch_base_top_movers(limit=30, pages=3):
@@ -332,7 +341,8 @@ def process_candidate(token_address: str):
         )
         return
 
-    liquidity = get_liquidity_usd(token_address)
+    pool_info = get_pool_info(token_address)
+    liquidity = pool_info["liquidity_usd"]
     if liquidity < MIN_LIQUIDITY_USD:
         notify_all(
             f"🔍 Refraction pass on `{token_address}` but liquidity (${liquidity:,.0f}) "
@@ -340,9 +350,35 @@ def process_candidate(token_address: str):
         )
         return
 
+    tax_note = ""
+    if REQUIRE_ZERO_TAX:
+        pool_address = pool_info["pool_address"]
+        if not pool_address:
+            notify_all(
+                f"🔍 Refraction pass on `{token_address}` but no pool address found for the "
+                f"tax check — not buying.\n{step_summary}\n{dex_url}"
+            )
+            return
+        tax = check_transfer_tax(token_address, pool_address)
+        if not tax["ok"]:
+            notify_all(
+                f"🔍 Refraction pass on `{token_address}` but the tax check was inconclusive "
+                f"({tax['reason']}) — not buying. If this keeps happening, RPC_URL likely "
+                f"doesn't support eth_call state overrides; point it at a provider that "
+                f"does.\n{step_summary}\n{dex_url}"
+            )
+            return
+        if not tax["is_zero_tax"]:
+            notify_all(
+                f"🔍 Refraction pass on `{token_address}` but a transfer tax was detected "
+                f"(~{tax['tax_pct']:.2f}%) — not buying.\n{step_summary}\n{dex_url}"
+            )
+            return
+        tax_note = " | tax: 0% confirmed"
+
     if execute_buy is None:
         notify_all(
-            f"🔍 Refraction pass on `{token_address}` (liquidity ${liquidity:,.0f}) — "
+            f"🔍 Refraction pass on `{token_address}` (liquidity ${liquidity:,.0f}{tax_note}) — "
             f"execute_buy not wired up yet, buy skipped.\n{step_summary}\n{dex_url}"
         )
         return
@@ -351,7 +387,7 @@ def process_candidate(token_address: str):
         buy_result = asyncio.run(execute_buy(token_address, BUY_USD))
         increment_daily_count()
         notify_all(
-            f"✅ Bought ${BUY_USD:.0f} of `{token_address}` (liquidity ${liquidity:,.0f}). "
+            f"✅ Bought ${BUY_USD:.0f} of `{token_address}` (liquidity ${liquidity:,.0f}{tax_note}). "
             f"tx: {buy_result.get('tx_hash', 'n/a')}\n{step_summary}\n{dex_url}"
         )
     except Exception as e:
