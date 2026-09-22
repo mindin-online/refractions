@@ -39,6 +39,15 @@ code:
   automatically fine just because it's a contract; an unverified
   "vault" holding nearly everything is exactly the risk this exists to
   catch, not exempt from it.
+- LP lock/burn: separate from all of the above, and arguably closer to
+  the most common real failure mode for early-stage tokens -- a pool
+  can be real, deep, and actively trading while 100% of its liquidity
+  sits in the deployer's wallet, redeemable the instant they want to
+  pull it. Sums the share of LP tokens GoPlus tags as locked (in a real
+  time-lock contract) or burned (sent to a dead address, permanent);
+  blocks if too little of the LP is actually secured this way. Uses the
+  SAME GoPlus response already being fetched for everything else here
+  -- no extra API call.
 
 This is deliberately kept as a SEPARATE, independent module from
 refraction_check.py's own on-chain holder-concentration check rather
@@ -57,6 +66,14 @@ MAX_SELL_TAX = float(os.environ.get("REFRACTION_MAX_SELL_TAX", "0.30"))
 MAX_BUY_TAX = float(os.environ.get("REFRACTION_MAX_BUY_TAX", "0.30"))
 MAX_HOLDER_PERCENT = float(os.environ.get("REFRACTION_MAX_GOPLUS_HOLDER_PCT", "0.20"))
 MAX_CREATOR_PERCENT = float(os.environ.get("REFRACTION_MAX_CREATOR_PCT", "0.15"))
+# Share of LP tokens that must be locked (in a real time-lock contract) or
+# burned (sent to a dead address, permanent) rather than sitting freely
+# redeemable in a wallet. This is the actual rug-pull mechanism most
+# early-stage tokens fail from -- not being unsellable, but whoever holds
+# the LP tokens pulling both sides of the pool out at will. A pool can be
+# real, deep, and actively trading while 100% of its LP tokens sit in the
+# deployer's wallet, redeemable the moment they want to.
+MIN_LP_LOCKED_PCT = float(os.environ.get("REFRACTION_MIN_LP_LOCKED_PCT", "0.80"))
 
 
 def check_honeypot(token_address: str) -> dict:
@@ -167,10 +184,34 @@ def check_honeypot(token_address: str) -> dict:
     if creator_pct > MAX_CREATOR_PERCENT:
         return unsafe(f"Creator wallet still holds {creator_pct * 100:.0f}% of supply (>{MAX_CREATOR_PERCENT * 100:.0f}% limit).")
 
+    # LP lock/burn check -- same GoPlus response, a field not read until
+    # now. Sums the share of LP tokens held by addresses GoPlus tags as
+    # locked or burned; the rest is sitting freely redeemable by whoever
+    # holds it. Missing data fails closed, same philosophy as everything
+    # else in this check -- "can't verify" is not "verified safe." Known
+    # limitation: GoPlus may not populate this for every pool type (e.g.
+    # some Aerodrome-specific pool designs), which would show as
+    # unverifiable here even for a genuinely fine token -- if this starts
+    # blocking pools you can otherwise confirm are locked, that's the
+    # first thing to check.
+    lp_holders = info.get("lp_holders") or []
+    if not lp_holders:
+        return unsafe("GoPlus returned no LP holder data -- can't verify liquidity lock status, blocking buy.")
+    locked_pct = sum(
+        float(h.get("percent") or 0) for h in lp_holders
+        if h.get("is_locked") == "1" or h.get("tag") == "Burn"
+    )
+    if locked_pct < MIN_LP_LOCKED_PCT:
+        return unsafe(
+            f"Only {locked_pct * 100:.0f}% of LP is locked/burned (<{MIN_LP_LOCKED_PCT * 100:.0f}% required) "
+            f"-- the rest can be pulled by whoever holds it."
+        )
+
     return {
         "ok": True,
         "is_safe": True,
-        "reason": "Passed honeypot/tax/ownership/concentration checks.",
+        "reason": "Passed honeypot/tax/ownership/concentration/LP-lock checks.",
         "buy_tax_pct": buy_tax * 100,
         "sell_tax_pct": sell_tax * 100,
+        "lp_locked_pct": locked_pct * 100,
     }
