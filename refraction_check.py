@@ -32,6 +32,11 @@ Steps:
 
   3. Reward token is a mainstream asset (USDC / WETH / cbBTC on Base),
      read from the contract's rewardsToken()/rewardToken() accessor.
+     Also distinguishes the common "pays in itself" pattern (stake TOKEN,
+     earn more TOKEN) from a genuine external-asset payout -- the former
+     is flagged with an explicit label, not just an unmatched address,
+     since it's a materially different (weaker) structure than paying
+     out in an already-established asset.
 
   4. Registered as an Aerodrome gauge, checked against Aerodrome's own
      Voter contract via isGauge() -- a real on-chain registry lookup, not
@@ -123,6 +128,22 @@ ADMIN_RISK_SIGNATURES = [
     "excludeFromFee(address)",
 ]
 
+ERC4626_ACCOUNTING_ABI = [
+    {"inputs": [], "name": "totalSupply", "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "totalAssets", "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "asset", "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"},
+]
+ERC20_BALANCE_ABI = [
+    {"inputs": [{"type": "address"}], "name": "balanceOf", "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
+]
+# Below this many raw shares outstanding, a vault is in the highest-risk
+# window for the classic ERC-4626 inflation attack (first depositor gets
+# 1 wei, donates a huge amount directly, inflates share price, later
+# depositors lose funds to rounding). This is a coarse proxy, not proof
+# the contract mints dead shares or uses virtual offsets -- it just means
+# the most dangerous window has likely passed once supply is meaningful.
+MIN_VAULT_SUPPLY_RAW = int(os.environ.get("REFRACTION_MIN_VAULT_SUPPLY_RAW", "100000"))
+
 
 def _env_flag(name: str, default: str) -> bool:
     return os.environ.get(name, default) not in ("0", "false", "False", "")
@@ -133,6 +154,7 @@ REQUIRE_HOLDER_CONCENTRATION = _env_flag("REFRACTION_REQUIRE_HOLDER_CONCENTRATIO
 REQUIRE_REWARD_TOKEN = _env_flag("REFRACTION_REQUIRE_REWARD_TOKEN", "1")
 REQUIRE_AERODROME_GAUGE = _env_flag("REFRACTION_REQUIRE_AERODROME_GAUGE", "0")
 REQUIRE_NO_ADMIN_KEYS = _env_flag("REFRACTION_REQUIRE_NO_ADMIN_KEYS", "1")
+REQUIRE_NO_INFLATION_RISK = _env_flag("REFRACTION_REQUIRE_NO_INFLATION_RISK", "1")
 MIN_HOLDER_PCT = float(os.environ.get("REFRACTION_MIN_HOLDER_PCT", "30"))
 MAX_HOLDER_PCT = float(os.environ.get("REFRACTION_MAX_HOLDER_PCT", "70"))
 
@@ -174,13 +196,15 @@ def _interface_match(bytecode_hex: str) -> dict:
     }
 
 
-def _get_reward_token(address: str) -> dict:
+def _get_reward_token(address: str, target: str) -> dict:
     for sig in REWARD_TOKEN_ACCESSORS:
         try:
             data = bytes(Web3.keccak(text=sig))[:4]
             result = w3.eth.call({"to": address, "data": data})
             if len(result) >= 32:
                 candidate = Web3.to_checksum_address("0x" + result[-20:].hex())
+                if candidate == target:
+                    return {"ok": True, "reward_token": candidate, "is_mainstream": False, "label": "pays in itself -- not an external asset"}
                 label = MAINSTREAM_REWARD_TOKENS.get(candidate)
                 return {"ok": True, "reward_token": candidate, "is_mainstream": label is not None, "label": label}
         except Exception:
@@ -202,6 +226,71 @@ def _check_admin_risk(bytecode_hex: str) -> dict:
     return {"no_admin_keys": len(found) == 0, "flagged_selectors": found}
 
 
+def _check_vault_liquidity_risk(address: str, pattern: str) -> dict:
+    """
+    Only meaningful for ERC-4626 vaults -- Synthetix-pattern contracts
+    don't expose totalAssets()/asset(), so this is a pass-through (not
+    applicable, not penalized) for those.
+
+    Checks two of the four risks from the standard ERC-4626 liquidity
+    writeup -- specifically the two that are actually checkable from
+    outside a contract before buying in, as opposed to things a vault's
+    own developer would need to fix:
+
+    1. Inflation-attack exposure (see MIN_VAULT_SUPPLY_RAW above).
+    2. Liquidity buffer: the vault's own direct balance of its underlying
+       asset vs totalAssets(). A vault holding little to none of its own
+       asset directly has deployed essentially everything elsewhere
+       (lending, other pools) -- a bank-run/insolvency risk if a large
+       withdrawal arrives and unwinding that external position isn't
+       instant. This is informational only (not gated), since many
+       legitimate vaults intentionally deploy near 100% and are still
+       fine depending on their yield source -- there's no clean universal
+       "safe" threshold to hard-gate on.
+
+    NOT checked, deliberately, rather than faked:
+    - MEV/sandwich risk on deposit/withdraw is about how a caller
+      interacts with the vault, not a property of the vault contract
+      itself -- already mitigated on our end via slippage_bps in the
+      swap quote (see wallet_funding.py / base_buy.py), not something
+      to detect about the target.
+    - Oracle manipulation requires knowing which specific price source a
+      given vault uses internally, which varies per-vault and isn't
+      generically introspectable from outside. This is a real gap, not
+      something worth faking a check for.
+    """
+    if pattern != "erc4626":
+        return {"applicable": False}
+
+    try:
+        contract = w3.eth.contract(address=address, abi=ERC4626_ACCOUNTING_ABI)
+        total_supply = contract.functions.totalSupply().call()
+        total_assets = contract.functions.totalAssets().call()
+        asset_address = contract.functions.asset().call()
+    except Exception as e:
+        return {"applicable": True, "ok": False, "reason": f"could not read vault accounting: {e}"}
+
+    inflation_risk = total_supply < MIN_VAULT_SUPPLY_RAW
+
+    liquidity_buffer_pct = None
+    try:
+        asset_contract = w3.eth.contract(address=Web3.to_checksum_address(asset_address), abi=ERC20_BALANCE_ABI)
+        vault_own_balance = asset_contract.functions.balanceOf(address).call()
+        if total_assets > 0:
+            liquidity_buffer_pct = (vault_own_balance / total_assets) * 100
+    except Exception:
+        pass
+
+    return {
+        "applicable": True,
+        "ok": True,
+        "total_supply": total_supply,
+        "total_assets": total_assets,
+        "inflation_risk": inflation_risk,
+        "liquidity_buffer_pct": liquidity_buffer_pct,
+    }
+
+
 def check_refraction(address: str) -> dict:
     """
     Runs every step regardless of which are required, so you always get
@@ -214,9 +303,10 @@ def check_refraction(address: str) -> dict:
 
     interface = _interface_match(bytecode_hex)
     holders = get_holder_concentration(w3, target)
-    reward = _get_reward_token(logic_address)
+    reward = _get_reward_token(logic_address, target)
     is_gauge = _is_aerodrome_gauge(target)
     admin_risk = _check_admin_risk(bytecode_hex)
+    vault_risk = _check_vault_liquidity_risk(logic_address, interface["pattern"])
 
     holder_pass = (
         holders["ok"]
@@ -224,12 +314,17 @@ def check_refraction(address: str) -> dict:
         and MIN_HOLDER_PCT <= holders["top_holder_pct"] <= MAX_HOLDER_PCT
     )
 
+    # Not applicable (Synthetix-pattern) or the read failed -> don't penalize;
+    # only fail this step when we positively confirmed low supply.
+    vault_supply_safe = not (vault_risk.get("applicable") and vault_risk.get("ok") and vault_risk.get("inflation_risk"))
+
     steps = {
         "interface_match": interface["is_match"],
         "holder_concentration_pass": holder_pass,
         "reward_token_mainstream": reward["is_mainstream"],
         "aerodrome_gauge": is_gauge,
         "no_admin_keys": admin_risk["no_admin_keys"],
+        "vault_supply_safe": vault_supply_safe,
     }
     gates = {
         "interface_match": REQUIRE_INTERFACE,
@@ -237,6 +332,7 @@ def check_refraction(address: str) -> dict:
         "reward_token_mainstream": REQUIRE_REWARD_TOKEN,
         "aerodrome_gauge": REQUIRE_AERODROME_GAUGE,
         "no_admin_keys": REQUIRE_NO_ADMIN_KEYS,
+        "vault_supply_safe": REQUIRE_NO_INFLATION_RISK,
     }
     passes_all = all(steps[k] for k, required in gates.items() if required)
 
@@ -251,5 +347,6 @@ def check_refraction(address: str) -> dict:
             "holders": holders,
             "reward": reward,
             "admin_risk": admin_risk,
+            "vault_risk": vault_risk,
         },
     }
