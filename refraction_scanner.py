@@ -31,6 +31,7 @@ Confirmed as of the real base_buy.py source: this is genuinely async
 asyncio.run() from the otherwise-synchronous scan loop.
 """
 import os
+import re
 import json
 import time
 import asyncio
@@ -200,6 +201,12 @@ def fetch_base_top_movers(limit=30, pages=3):
             base_token = ((item.get("relationships") or {}).get("base_token") or {}).get("data") or {}
             raw_id = base_token.get("id", "")
             token_address = raw_id.split("_", 1)[1] if "_" in raw_id else None
+            # Guard against the exact failure mode flagged when this was built:
+            # if GeckoTerminal's id format doesn't match "base_0x...", this would
+            # silently produce a garbled/truncated address otherwise.
+            if token_address and not re.fullmatch(r"0x[0-9a-fA-F]{40}", token_address):
+                log.warning("Skipping malformed token address from GeckoTerminal: %r (raw id: %r)", token_address, raw_id)
+                token_address = None
 
             if change_h1 is None or token_address is None:
                 continue
@@ -315,12 +322,17 @@ def format_step_summary(result: dict) -> str:
 
 
 def process_candidate(token_address: str):
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", token_address or ""):
+        log.warning("Skipping malformed candidate address: %r", token_address)
+        return
+
     seen_key = f"refraction:seen:{token_address.lower()}"
     if r.exists(seen_key):
         return
     r.set(seen_key, "1", ex=SEEN_TTL)
 
     result = check_refraction(token_address)
+    token_address = result["address"]  # use the checksummed form from here on, for consistent display/logging
     dex_url = f"https://dexscreener.com/base/{token_address}"
 
     if not result["passes_all"]:
