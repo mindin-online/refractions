@@ -253,6 +253,7 @@ def log_candidate(token_address: str, result: dict, status: str):
     digest below and the !rlog Discord command (same Redis, different
     service) -- capped list so it never grows unbounded."""
     holders = result["detail"]["holders"]
+    reward = result["detail"]["reward"]
     entry = {
         "address": token_address,
         "timestamp": time.time(),
@@ -260,6 +261,8 @@ def log_candidate(token_address: str, result: dict, status: str):
         "steps": result["steps"],
         "interface_pattern": result["detail"]["interface"].get("pattern"),
         "holder_pct": holders.get("top_holder_pct") if holders.get("ok") else None,
+        "reward_label": reward.get("label") if reward.get("ok") else None,
+        "reward_token": reward.get("reward_token") if reward.get("ok") else None,
     }
     pipe = r.pipeline()
     pipe.rpush(LOG_LIST_KEY, json.dumps(entry))
@@ -302,10 +305,12 @@ def maybe_send_digest():
 
     lines = [f"📋 **Refraction digest** — {len(passes)} pass(es), {len(near_misses)} near-miss(es)"]
     for e in passes:
-        lines.append(f"✅ `{e['address']}` — {e['interface_pattern'] or '?'} pattern")
+        reward_note = f" — pays: {e['reward_label']}" if e.get("reward_label") else ""
+        lines.append(f"✅ `{e['address']}` — {e['interface_pattern'] or '?'} pattern{reward_note}")
     for e in near_misses:
         gates_passed = [k for k, v in e["steps"].items() if v]
-        lines.append(f"🔸 `{e['address']}` — passed: {', '.join(gates_passed) or 'none'}")
+        reward_note = f" — pays: {e['reward_label']}" if e.get("reward_label") else ""
+        lines.append(f"🔸 `{e['address']}` — passed: {', '.join(gates_passed) or 'none'}{reward_note}")
 
     notify_all("\n".join(lines), subject=f"Refraction digest — {len(passes)} pass, {len(near_misses)} near-miss")
 
@@ -318,6 +323,12 @@ def format_step_summary(result: dict) -> str:
         marker = "✓" if passed else "✗"
         tag = " (required)" if name in active else " (bonus)"
         lines.append(f"{marker} {name}{tag}")
+
+    reward = result["detail"]["reward"]
+    if reward.get("ok") and reward.get("reward_token"):
+        label = reward.get("label") or "not a mainstream asset"
+        lines.append(f"pays out in: {reward['reward_token']} ({label})")
+
     return "\n".join(lines)
 
 
