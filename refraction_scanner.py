@@ -43,6 +43,7 @@ import requests
 
 from refraction_check import check_refraction
 from refraction_tax_check import check_transfer_tax
+from refraction_honeypot_check import check_honeypot
 
 try:
     from base_buy import execute_buy
@@ -58,6 +59,7 @@ BUY_USD = float(os.environ.get("REFRACTION_BUY_USD", "10"))
 MAX_BUYS_PER_DAY = int(os.environ.get("REFRACTION_MAX_BUYS_PER_DAY", "3"))
 MIN_LIQUIDITY_USD = float(os.environ.get("REFRACTION_MIN_LIQUIDITY_USD", "5000"))
 REQUIRE_ZERO_TAX = os.environ.get("REFRACTION_REQUIRE_ZERO_TAX", "1") not in ("0", "false", "False", "")
+REQUIRE_HONEYPOT_SAFE = os.environ.get("REFRACTION_REQUIRE_HONEYPOT_SAFE", "1") not in ("0", "false", "False", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "120"))
 
 DEXSCREENER_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
@@ -398,6 +400,23 @@ def process_candidate(token_address: str):
             )
             return
         tax_note = " | tax: 0% confirmed"
+
+    if REQUIRE_HONEYPOT_SAFE:
+        honeypot = check_honeypot(token_address)
+        if not honeypot["ok"]:
+            notify_all(
+                f"🔍 Refraction pass on `{token_address}` but the GoPlus honeypot check was "
+                f"inconclusive ({honeypot['reason']}) — not buying. Often just means the token "
+                f"is too new for their indexer yet.\n{step_summary}\n{dex_url}"
+            )
+            return
+        if not honeypot["is_safe"]:
+            notify_all(
+                f"🔍 Refraction pass on `{token_address}` but GoPlus flagged it: "
+                f"{', '.join(honeypot['flags'])} — not buying.\n{step_summary}\n{dex_url}"
+            )
+            return
+        tax_note += " | GoPlus: clean"
 
     if execute_buy is None:
         notify_all(
