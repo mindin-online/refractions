@@ -44,6 +44,7 @@ import requests
 from refraction_check import check_refraction
 from refraction_tax_check import check_transfer_tax
 from refraction_honeypot_check import check_honeypot
+from refraction_honeypot_is_check import check_honeypot_is
 
 try:
     from base_buy import execute_buy
@@ -60,6 +61,7 @@ MAX_BUYS_PER_DAY = int(os.environ.get("REFRACTION_MAX_BUYS_PER_DAY", "3"))
 MIN_LIQUIDITY_USD = float(os.environ.get("REFRACTION_MIN_LIQUIDITY_USD", "5000"))
 REQUIRE_ZERO_TAX = os.environ.get("REFRACTION_REQUIRE_ZERO_TAX", "1") not in ("0", "false", "False", "")
 REQUIRE_HONEYPOT_SAFE = os.environ.get("REFRACTION_REQUIRE_HONEYPOT_SAFE", "1") not in ("0", "false", "False", "")
+REQUIRE_HONEYPOT_IS_SAFE = os.environ.get("REFRACTION_REQUIRE_HONEYPOT_IS_SAFE", "1") not in ("0", "false", "False", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "120"))
 
 DEXSCREENER_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
@@ -155,23 +157,56 @@ def fetch_new_base_profiles():
 
 
 def get_pool_info(token_address: str) -> dict:
-    """Returns {'liquidity_usd': float, 'pool_address': str|None} for the
-    deepest pair -- the pool address is needed by the tax check (it holds
-    a real token balance to simulate a transfer from)."""
+    """Returns {'liquidity_usd': float, 'pool_address': str|None,
+    'buys24h': int, 'sells24h': int} for the deepest pair. buys24h/
+    sells24h feed the free "real buyers who could never sell" honeypot
+    signal below -- data DexScreener already returns in this same call,
+    ported from a working implementation that uses the GeckoTerminal
+    equivalent of this exact field."""
     try:
         resp = requests.get(DEXSCREENER_PAIRS_URL.format(token_address), timeout=15)
         resp.raise_for_status()
         pairs = resp.json()
         if not pairs:
-            return {"liquidity_usd": 0.0, "pool_address": None}
+            return {"liquidity_usd": 0.0, "pool_address": None, "buys24h": 0, "sells24h": 0}
         best = max(pairs, key=lambda p: (p.get("liquidity", {}) or {}).get("usd", 0) or 0)
+        txns_h24 = (best.get("txns", {}) or {}).get("h24", {}) or {}
         return {
             "liquidity_usd": (best.get("liquidity", {}) or {}).get("usd", 0) or 0,
             "pool_address": best.get("pairAddress"),
+            "buys24h": int(txns_h24.get("buys", 0) or 0),
+            "sells24h": int(txns_h24.get("sells", 0) or 0),
         }
     except Exception as e:
         log.error("Pool info lookup failed for %s: %s", token_address, e)
-        return {"liquidity_usd": 0.0, "pool_address": None}
+        return {"liquidity_usd": 0.0, "pool_address": None, "buys24h": 0, "sells24h": 0}
+
+
+# Minimum buy sample before treating a zero-sells count as meaningful
+# rather than just low activity noise -- same reasoning and same number
+# as the source this was ported from.
+MIN_BUY_SAMPLE_FOR_HONEYPOT_SIGNAL = int(os.environ.get("REFRACTION_MIN_BUY_SAMPLE", "5"))
+
+
+def _resolve_token_address(pool: dict, included: list):
+    """
+    Correct approach (ported from a working implementation that hit this
+    exact bug first): resolve the base token's real address via the
+    `included` array, not by string-splitting the relationship's `id`
+    field. That id-splitting approach is what produced the truncated
+    "0x21C82597..." address seen earlier -- this reads the token's actual
+    attributes.address instead, which is what the id was never guaranteed
+    to cleanly contain in the first place.
+
+    Also requires include=base_token,quote_token on the request -- without
+    it, GeckoTerminal doesn't return the `included` array at all, and this
+    silently returns nothing for every pool.
+    """
+    base_token_id = (pool.get("relationships") or {}).get("base_token", {}).get("data", {}).get("id")
+    if not base_token_id:
+        return None
+    match = next((t for t in included if t.get("id") == base_token_id), None)
+    return (match or {}).get("attributes", {}).get("address")
 
 
 def fetch_base_top_movers(limit=30, pages=3):
@@ -180,18 +215,19 @@ def fetch_base_top_movers(limit=30, pages=3):
     price change client-side -- there's no direct 'sort by h1 change'
     parameter. Filters out anything below MIN_LIQUIDITY_USD before
     ranking, so obvious low-liquidity wick noise doesn't waste RPC/API
-    calls downstream. Verify the id-parsing below against a live
-    response on first run -- written from GeckoTerminal's documented id
-    format ("base_0x...") but not tested against a real payload yet."""
+    calls downstream."""
     candidates = []
     for page in range(1, pages + 1):
         try:
             resp = requests.get(GECKOTERMINAL_POOLS_URL, params={
                 "sort": "h24_volume_usd_desc",
                 "page": page,
+                "include": "base_token,quote_token",
             }, timeout=15)
             resp.raise_for_status()
-            data = resp.json().get("data", [])
+            payload = resp.json()
+            data = payload.get("data", [])
+            included = payload.get("included", [])
         except Exception as e:
             log.error("GeckoTerminal pools fetch failed (page %s): %s", page, e)
             continue
@@ -200,14 +236,10 @@ def fetch_base_top_movers(limit=30, pages=3):
             attrs = item.get("attributes", {}) or {}
             change_h1 = (attrs.get("price_change_percentage") or {}).get("h1")
             liquidity = attrs.get("reserve_in_usd")
-            base_token = ((item.get("relationships") or {}).get("base_token") or {}).get("data") or {}
-            raw_id = base_token.get("id", "")
-            token_address = raw_id.split("_", 1)[1] if "_" in raw_id else None
-            # Guard against the exact failure mode flagged when this was built:
-            # if GeckoTerminal's id format doesn't match "base_0x...", this would
-            # silently produce a garbled/truncated address otherwise.
+            token_address = _resolve_token_address(item, included)
+
             if token_address and not re.fullmatch(r"0x[0-9a-fA-F]{40}", token_address):
-                log.warning("Skipping malformed token address from GeckoTerminal: %r (raw id: %r)", token_address, raw_id)
+                log.warning("Skipping malformed token address from GeckoTerminal: %r", token_address)
                 token_address = None
 
             if change_h1 is None or token_address is None:
@@ -344,6 +376,18 @@ def process_candidate(token_address: str):
         return
     r.set(seen_key, "1", ex=SEEN_TTL)
 
+    # Cheap pre-filter, before spending any RPC calls on the real checks:
+    # real buyers who never once managed to sell is one of the strongest
+    # honeypot tells there is, and DexScreener already returns this data
+    # for free in the same lookup used for the liquidity check later.
+    early_pool_info = get_pool_info(token_address)
+    if early_pool_info["buys24h"] >= MIN_BUY_SAMPLE_FOR_HONEYPOT_SIGNAL and early_pool_info["sells24h"] == 0:
+        log.info(
+            "Skipping %s: %d buys but 0 sells in 24h -- strong honeypot signal, not spending checks on it",
+            token_address, early_pool_info["buys24h"],
+        )
+        return
+
     result = check_refraction(token_address)
     token_address = result["address"]  # use the checksummed form from here on, for consistent display/logging
     dex_url = f"https://dexscreener.com/base/{token_address}"
@@ -366,6 +410,10 @@ def process_candidate(token_address: str):
         )
         return
 
+    # Re-check fresh rather than reuse early_pool_info -- check_refraction()
+    # takes real time (several RPC calls), and liquidity is exactly the
+    # kind of thing worth re-verifying right before a buy rather than
+    # trusting a reading from a minute ago.
     pool_info = get_pool_info(token_address)
     liquidity = pool_info["liquidity_usd"]
     if liquidity < MIN_LIQUIDITY_USD:
@@ -406,17 +454,32 @@ def process_candidate(token_address: str):
         if not honeypot["ok"]:
             notify_all(
                 f"🔍 Refraction pass on `{token_address}` but the GoPlus honeypot check was "
-                f"inconclusive ({honeypot['reason']}) — not buying. Often just means the token "
-                f"is too new for their indexer yet.\n{step_summary}\n{dex_url}"
+                f"inconclusive ({honeypot['reason']}) — not buying.\n{step_summary}\n{dex_url}"
             )
             return
         if not honeypot["is_safe"]:
             notify_all(
-                f"🔍 Refraction pass on `{token_address}` but GoPlus flagged it: "
-                f"{', '.join(honeypot['flags'])} — not buying.\n{step_summary}\n{dex_url}"
+                f"🔍 Refraction pass on `{token_address}` but GoPlus said: "
+                f"{honeypot['reason']} — not buying.\n{step_summary}\n{dex_url}"
             )
             return
         tax_note += " | GoPlus: clean"
+
+    if REQUIRE_HONEYPOT_IS_SAFE:
+        honeypot_is = check_honeypot_is(token_address)
+        if not honeypot_is["ok"]:
+            notify_all(
+                f"🔍 Refraction pass on `{token_address}` but the honeypot.is check errored "
+                f"({honeypot_is['reason']}) — not buying.\n{step_summary}\n{dex_url}"
+            )
+            return
+        if not honeypot_is["is_safe"]:
+            notify_all(
+                f"🔍 Refraction pass on `{token_address}` but honeypot.is said: "
+                f"{honeypot_is['reason']} — not buying.\n{step_summary}\n{dex_url}"
+            )
+            return
+        tax_note += " | honeypot.is: clean"
 
     if execute_buy is None:
         notify_all(
