@@ -59,6 +59,12 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 BUY_USD = float(os.environ.get("REFRACTION_BUY_USD", "10"))
 MAX_BUYS_PER_DAY = int(os.environ.get("REFRACTION_MAX_BUYS_PER_DAY", "3"))
 MIN_LIQUIDITY_USD = float(os.environ.get("REFRACTION_MIN_LIQUIDITY_USD", "5000"))
+# Separate, lower, EARLIER tier from the gate above -- applied before any
+# expensive checks run at all, so a $50-liquidity dead pool doesn't get
+# the same full pipeline (interface match, holder concentration, GoPlus,
+# honeypot.is) as a genuinely liquid one. Pure noise below this gets
+# skipped entirely, not even logged as a near-miss.
+NOISE_LIQUIDITY_USD = float(os.environ.get("REFRACTION_NOISE_LIQUIDITY_USD", "1000"))
 REQUIRE_ZERO_TAX = os.environ.get("REFRACTION_REQUIRE_ZERO_TAX", "1") not in ("0", "false", "False", "")
 REQUIRE_HONEYPOT_SAFE = os.environ.get("REFRACTION_REQUIRE_HONEYPOT_SAFE", "1") not in ("0", "false", "False", "")
 REQUIRE_HONEYPOT_IS_SAFE = os.environ.get("REFRACTION_REQUIRE_HONEYPOT_IS_SAFE", "1") not in ("0", "false", "False", "")
@@ -75,6 +81,7 @@ DAILY_COUNT_KEY = "refraction:daily_count"
 LOG_LIST_KEY = "refraction:log"          # capped list of passes + near-misses, read by !rlog too
 LOG_LIST_MAX = 200
 LAST_DIGEST_KEY = "refraction:last_digest_at"
+CIRCUIT_BREAKER_KEY = "refraction:circuit_breaker"  # JSON: {tripped, reason, token, timestamp} or absent
 DIGEST_INTERVAL_SECONDS = int(os.environ.get("REFRACTION_DIGEST_INTERVAL_SECONDS", str(12 * 3600)))
 
 # --- periodic top-1h-movers scan (Base) ---
@@ -245,7 +252,7 @@ def fetch_base_top_movers(limit=30, pages=3):
             if change_h1 is None or token_address is None:
                 continue
             try:
-                if liquidity is not None and float(liquidity) < MIN_LIQUIDITY_USD:
+                if liquidity is not None and float(liquidity) < NOISE_LIQUIDITY_USD:
                     continue
             except (TypeError, ValueError):
                 pass
@@ -302,6 +309,48 @@ def log_candidate(token_address: str, result: dict, status: str):
     pipe.rpush(LOG_LIST_KEY, json.dumps(entry))
     pipe.ltrim(LOG_LIST_KEY, -LOG_LIST_MAX, -1)
     pipe.execute()
+
+
+BUY_ENABLED_KEY = "refraction:base:buy_enabled"  # absent or "1" = enabled, "0" = paused
+
+
+def is_buy_enabled() -> bool:
+    val = r.get(BUY_ENABLED_KEY)
+    return val != "0"  # default enabled if never set
+
+
+def trip_circuit_breaker(reason: str, token_address: str):
+    """Disables the scanner entirely until a human reviews and clears it
+    via !rresume in Discord -- deliberately not an auto-reset, since a
+    failed test-sell is a strong enough signal to warrant a human
+    actually looking at what happened before anything resumes."""
+    payload = {
+        "tripped": True,
+        "reason": reason,
+        "token": token_address,
+        "timestamp": time.time(),
+    }
+    r.set(CIRCUIT_BREAKER_KEY, json.dumps(payload))
+    notify_all(
+        f"🛑 **CIRCUIT BREAKER TRIPPED** — refraction scanner disabled.\n"
+        f"Token: `{token_address}`\nReason: {reason}\n\n"
+        f"Scanning is paused until you review this and run `!rresume confirm` in Discord.",
+        subject="🛑 Refraction circuit breaker tripped",
+    )
+
+
+def get_circuit_breaker_status():
+    raw = r.get(CIRCUIT_BREAKER_KEY)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def clear_circuit_breaker():
+    r.delete(CIRCUIT_BREAKER_KEY)
 
 
 def maybe_send_digest():
@@ -381,6 +430,8 @@ def process_candidate(token_address: str):
     # honeypot tells there is, and DexScreener already returns this data
     # for free in the same lookup used for the liquidity check later.
     early_pool_info = get_pool_info(token_address)
+    if early_pool_info["liquidity_usd"] < NOISE_LIQUIDITY_USD:
+        return  # pure noise, not even worth logging as a near-miss
     if early_pool_info["buys24h"] >= MIN_BUY_SAMPLE_FOR_HONEYPOT_SIGNAL and early_pool_info["sells24h"] == 0:
         log.info(
             "Skipping %s: %d buys but 0 sells in 24h -- strong honeypot signal, not spending checks on it",
@@ -402,6 +453,13 @@ def process_candidate(token_address: str):
     log.info("Refraction pass: %s", token_address)
     log_candidate(token_address, result, "pass")
     step_summary = format_step_summary(result)
+
+    if not is_buy_enabled():
+        notify_all(
+            f"🔍 Refraction pass on `{token_address}` — buying is currently paused "
+            f"(`!rbuy base on` to resume) — not spending further checks on it.\n{step_summary}\n{dex_url}"
+        )
+        return
 
     if buys_today() >= MAX_BUYS_PER_DAY:
         notify_all(
@@ -491,8 +549,25 @@ def process_candidate(token_address: str):
     try:
         buy_result = asyncio.run(execute_buy(token_address, BUY_USD))
         increment_daily_count()
+
+        test_sell = buy_result.get("test_sell") or {}
+        if test_sell.get("attempted") and test_sell.get("ok") is False:
+            # The buy itself succeeded -- real funds spent, real tokens
+            # received -- so this is reported distinctly from a buy
+            # failure, then the breaker takes over from here.
+            notify_all(
+                f"⚠️ Bought `{token_address}` but the immediate test-sell FAILED: "
+                f"{test_sell.get('reason')}\n{step_summary}\n{dex_url}"
+            )
+            trip_circuit_breaker(
+                f"Test-sell failed on `{token_address}` after a real buy: {test_sell.get('reason')}",
+                token_address,
+            )
+            return
+
+        test_sell_note = " | test-sell: confirmed sellable" if test_sell.get("ok") else ""
         notify_all(
-            f"✅ Bought ${BUY_USD:.0f} of `{token_address}` (liquidity ${liquidity:,.0f}{tax_note}). "
+            f"✅ Bought ${BUY_USD:.0f} of `{token_address}` (liquidity ${liquidity:,.0f}{tax_note}{test_sell_note}). "
             f"tx: {buy_result.get('tx_hash', 'n/a')}\n{step_summary}\n{dex_url}"
         )
     except Exception as e:
@@ -505,10 +580,14 @@ def run():
               POLL_INTERVAL, BUY_USD, MAX_BUYS_PER_DAY, MIN_LIQUIDITY_USD)
     while True:
         try:
-            for profile in fetch_new_base_profiles():
-                process_candidate(profile["tokenAddress"])
-            maybe_run_mover_scan()
-            maybe_send_digest()
+            breaker = get_circuit_breaker_status()
+            if breaker and breaker.get("tripped"):
+                log.warning("Circuit breaker tripped (%s) -- scanning paused, run !rresume in Discord to review.", breaker.get("reason"))
+            else:
+                for profile in fetch_new_base_profiles():
+                    process_candidate(profile["tokenAddress"])
+                maybe_run_mover_scan()
+                maybe_send_digest()
         except Exception as e:
             log.error("Scan loop error: %s", e)
         time.sleep(POLL_INTERVAL)
