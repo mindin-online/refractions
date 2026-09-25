@@ -117,6 +117,33 @@ ERC4626_SIGNATURES = [
 
 REWARD_TOKEN_ACCESSORS = ["rewardsToken()", "rewardToken()"]
 
+# Classic "reflection" pattern (RFI, then SafeMoon and hundreds of direct
+# forks) -- architecturally nothing like Synthetix/ERC-4626. No separate
+# staking contract at all: every transfer silently redistributes a cut to
+# all holders via a rebasing-balance trick baked directly into the
+# token's own _transfer(). This is the ORIGINAL sense of "reflection
+# token" as a term, distinct from the staking/vault patterns this file
+# already detects.
+#
+# The core state (_rOwned/_tOwned/_rTotal/_tTotal) is almost always
+# declared private in the standard implementation, so it has no ABI
+# selector to scan for -- these are the PUBLIC/EXTERNAL function names
+# from that same standard codebase instead, which is heavily and
+# consistently forked, giving real confidence in this signature set.
+# Purely diagnostic, never gates a buy: pays in the SAME token (self-
+# referential), not a genuine external asset, so it can't satisfy
+# reward_token_mainstream even when detected -- see summarize_reflection().
+CLASSIC_REFLECTION_SIGNATURES = [
+    "deliver(uint256)",
+    "reflectionFromToken(uint256,bool)",
+    "tokenFromReflection(uint256)",
+    "excludeFromReward(address)",
+    "includeInReward(address)",
+    "isExcludedFromReward(address)",
+    "totalFees()",
+]
+CLASSIC_REFLECTION_MIN_MATCHES = 2  # informational threshold, deliberately looser than the strict gates
+
 ADMIN_RISK_SIGNATURES = [
     "owner()",
     "renounceOwnership()",
@@ -226,6 +253,38 @@ def _check_admin_risk(bytecode_hex: str) -> dict:
     return {"no_admin_keys": len(found) == 0, "flagged_selectors": found}
 
 
+def _check_classic_reflection(bytecode_hex: str) -> dict:
+    matches = _match_function_set(bytecode_hex, CLASSIC_REFLECTION_SIGNATURES)
+    found = [sig for sig, present in matches.items() if present]
+    return {"detected": len(found) >= CLASSIC_REFLECTION_MIN_MATCHES, "matched_selectors": found}
+
+
+def summarize_reflection(result: dict) -> str:
+    """
+    One-line, human-readable answer to "does this pay reflections, and
+    in what" -- built from a full check_refraction() result. Used
+    everywhere this needs to be shown (!check, !rlog, digest, real-time
+    alerts) so the wording only lives in one place. Reports on EVERY
+    candidate regardless of passes_all, since this is diagnostic, not
+    gating.
+    """
+    interface = result["detail"]["interface"]
+    reward = result["detail"]["reward"]
+    classic = result["detail"].get("classic_reflection", {})
+
+    if interface.get("is_match"):
+        pattern_label = "ERC-4626 vault" if interface["pattern"] == "erc4626" else "Synthetix staking"
+        if reward.get("ok") and reward.get("reward_token"):
+            payout = reward["label"] if reward.get("label") else (f"unlabeled asset ({reward['reward_token']})" if not reward.get("is_mainstream") else reward["reward_token"])
+            return f"reflection: {pattern_label} — pays {payout}"
+        return f"reflection: {pattern_label} — reward token undetermined"
+
+    if classic.get("detected"):
+        return f"reflection: classic pattern ({', '.join(classic['matched_selectors'])}) — pays in itself, not a genuine external asset"
+
+    return "reflection: none detected"
+
+
 def _check_vault_liquidity_risk(address: str, pattern: str) -> dict:
     """
     Only meaningful for ERC-4626 vaults -- Synthetix-pattern contracts
@@ -307,6 +366,7 @@ def check_refraction(address: str) -> dict:
     is_gauge = _is_aerodrome_gauge(target)
     admin_risk = _check_admin_risk(bytecode_hex)
     vault_risk = _check_vault_liquidity_risk(logic_address, interface["pattern"])
+    classic_reflection = _check_classic_reflection(bytecode_hex)
 
     holder_pass = (
         holders["ok"]
@@ -348,5 +408,6 @@ def check_refraction(address: str) -> dict:
             "reward": reward,
             "admin_risk": admin_risk,
             "vault_risk": vault_risk,
+            "classic_reflection": classic_reflection,
         },
     }
