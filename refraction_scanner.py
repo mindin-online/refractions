@@ -41,7 +41,7 @@ from datetime import datetime, timedelta, timezone
 import redis
 import requests
 
-from refraction_check import check_refraction
+from refraction_check import check_refraction, summarize_reflection
 from refraction_tax_check import check_transfer_tax
 from refraction_honeypot_check import check_honeypot
 from refraction_honeypot_is_check import check_honeypot_is
@@ -304,6 +304,7 @@ def log_candidate(token_address: str, result: dict, status: str):
         "holder_pct": holders.get("top_holder_pct") if holders.get("ok") else None,
         "reward_label": reward.get("label") if reward.get("ok") else None,
         "reward_token": reward.get("reward_token") if reward.get("ok") else None,
+        "reflection_summary": summarize_reflection(result),
     }
     pipe = r.pipeline()
     pipe.rpush(LOG_LIST_KEY, json.dumps(entry))
@@ -388,12 +389,12 @@ def maybe_send_digest():
 
     lines = [f"📋 **Refraction digest** — {len(passes)} pass(es), {len(near_misses)} near-miss(es)"]
     for e in passes:
-        reward_note = f" — pays: {e['reward_label']}" if e.get("reward_label") else ""
-        lines.append(f"✅ `{e['address']}` — {e['interface_pattern'] or '?'} pattern{reward_note}")
+        reflection_note = f" — {e['reflection_summary']}" if e.get("reflection_summary") else ""
+        lines.append(f"✅ `{e['address']}` — {e['interface_pattern'] or '?'} pattern{reflection_note}")
     for e in near_misses:
         gates_passed = [k for k, v in e["steps"].items() if v]
-        reward_note = f" — pays: {e['reward_label']}" if e.get("reward_label") else ""
-        lines.append(f"🔸 `{e['address']}` — passed: {', '.join(gates_passed) or 'none'}{reward_note}")
+        reflection_note = f" — {e['reflection_summary']}" if e.get("reflection_summary") else ""
+        lines.append(f"🔸 `{e['address']}` — passed: {', '.join(gates_passed) or 'none'}{reflection_note}")
 
     notify_all("\n".join(lines), subject=f"Refraction digest — {len(passes)} pass, {len(near_misses)} near-miss")
 
@@ -407,10 +408,7 @@ def format_step_summary(result: dict) -> str:
         tag = " (required)" if name in active else " (bonus)"
         lines.append(f"{marker} {name}{tag}")
 
-    reward = result["detail"]["reward"]
-    if reward.get("ok") and reward.get("reward_token"):
-        label = reward.get("label") or "not a mainstream asset"
-        lines.append(f"pays out in: {reward['reward_token']} ({label})")
+    lines.append(summarize_reflection(result))
 
     return "\n".join(lines)
 
