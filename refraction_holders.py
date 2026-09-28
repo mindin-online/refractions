@@ -1,39 +1,83 @@
 """
-refraction_holders.py (v3 — free, on-chain approximation)
+refraction_holders.py (v4 -- top holders, classified)
 
-Top-holder concentration check via Transfer-event log reconstruction --
-no third-party API, no billing account to get suspended or rate-limited.
-This works well specifically because these are freshly-launched tokens
-(pulled from DexScreener's newest-profiles feed): total Transfer history
-is small enough to scan directly over a bounded recent block window,
-using the same free Base RPC everything else already uses.
+WHY THIS WAS REDESIGNED. The previous version answered one question --
+"is the single biggest holder a contract, holding 30-70%?" -- and that
+question conflated three completely different things:
 
-Scans eth_getLogs for the token's Transfer events across the last
-HOLDER_SCAN_BLOCK_WINDOW blocks (default 50,000 -- roughly a day and a
-half at Base's ~2s block time), chunked to stay within public RPC log
-range limits, and reconstructs approximate balances by tallying
-transfers in/out. This is bounded by the scan window -- if a token is
-older than the window or has unusually heavy transfer volume, the
-result comes back flagged "approximate" rather than silently guessed at.
+  1. a genuine separate staking/vault contract (what the check was
+     originally after),
+  2. the DEX liquidity itself (a contract too -- and on Uniswap v4 it is
+     ONE shared singleton, the PoolManager, holding every token's
+     liquidity), and
+  3. a burn address (no bytecode, so it read as "not a contract" and
+     failed, punishing a permanent supply burn).
 
-Same function signature and return contract as the previous
-provider-based versions, so this is a drop-in replacement -- no changes
-needed in refraction_check.py.
+Concrete evidence it was misfiring: the one real token where the old
+gate passed had 33.7% held by 0x498581ff...2b2b -- which Uniswap's own
+deployments page lists as the v4 PoolManager on Base. The gate was
+rewarding the liquidity pool as if it were a staking contract.
+
+WHAT THIS RETURNS NOW. The top holders, each classified:
+
+    burn      -- known burn address (permanent, harmless)
+    pool      -- an AMM pool (detected on-chain: token0()/token1() include
+                 this token) or a known singleton such as Uniswap v4's
+                 PoolManager. Whether pool concentration is GOOD or BAD
+                 depends entirely on whether the LP is locked -- that's a
+                 separate check (LP lock/burn in the GoPlus module), so
+                 this file deliberately does not judge it.
+    contract  -- any other contract: candidate staking/vault/vesting/
+                 locker. refraction_check.py scans these for a reward
+                 mechanism instead of assuming what they are.
+    wallet    -- an ordinary externally-owned account.
+
+HOW BALANCES ARE READ. Transfer logs over a bounded recent window are
+used ONLY to discover candidate holder addresses. Their actual balances
+are then read live with balanceOf(). The old version trusted the
+log-reconstructed balances, which is wrong for reflection tokens (their
+balances grow with NO Transfer event -- exactly the tokens being hunted)
+and for any token older than the scan window.
+
+KNOWN LIMITATION, stated plainly: candidates come from the recent
+window, so a large holder that hasn't moved in ~a day can be missed on an
+older token. Fine for fresh launches; for established tokens a holder
+list from an indexer (e.g. GoPlus's `holders`) is the better source.
 """
 import os
 from web3 import Web3
 
 BLOCK_WINDOW = int(os.environ.get("HOLDER_SCAN_BLOCK_WINDOW", "50000"))
 CHUNK_SIZE = int(os.environ.get("HOLDER_SCAN_CHUNK_SIZE", "2000"))
-MAX_LOGS = int(os.environ.get("HOLDER_SCAN_MAX_LOGS", "20000"))  # safety cap
+MAX_LOGS = int(os.environ.get("HOLDER_SCAN_MAX_LOGS", "20000"))
+CANDIDATES_TO_READ = int(os.environ.get("REFRACTION_HOLDER_CANDIDATES", "15"))
+TOP_N = int(os.environ.get("REFRACTION_HOLDER_TOP_N", "6"))
 
 TRANSFER_TOPIC = "0x" + bytes(Web3.keccak(text="Transfer(address,address,uint256)")).hex()
+TOKEN0_DATA = bytes(Web3.keccak(text="token0()"))[:4]
+TOKEN1_DATA = bytes(Web3.keccak(text="token1()"))[:4]
 
-ERC20_MINIMAL_ABI = [
+ERC20_ABI = [
     {"inputs": [], "name": "totalSupply", "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [{"type": "address"}], "name": "balanceOf", "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
 ]
 
 ZERO_ADDRESS = Web3.to_checksum_address("0x0000000000000000000000000000000000000000")
+
+BURN_ADDRESSES = {
+    "0x0000000000000000000000000000000000000000",
+    "0x000000000000000000000000000000000000dead",
+}
+
+# Singletons that hold pool liquidity for MANY tokens at once. Uniswap v4
+# (verified against Uniswap's own deployments page, Base = chain 8453):
+KNOWN_POOL_SINGLETONS = {
+    "0x498581ff718922c3f8e6a244956af099b2652b2b": "Uniswap v4 PoolManager (Base)",
+}
+for _extra in os.environ.get("REFRACTION_EXTRA_POOL_ADDRESSES", "").split(","):
+    _extra = _extra.strip().lower()
+    if _extra:
+        KNOWN_POOL_SINGLETONS[_extra] = "configured pool address"
 
 
 def _fetch_transfer_logs(w3, token_address: str):
@@ -56,39 +100,80 @@ def _fetch_transfer_logs(w3, token_address: str):
         except Exception:
             pass  # skip chunk on RPC error (range limits, timeouts) -- best-effort
         if len(logs) > MAX_LOGS:
-            return logs, False, any_chunk_succeeded  # too much volume, bail -- incomplete
+            return logs, False, any_chunk_succeeded
         start = end + 1
     return logs, True, any_chunk_succeeded
+
+
+def _read_address(w3, to: str, data: bytes):
+    result = w3.eth.call({"to": to, "data": data})
+    if len(result) >= 32:
+        return Web3.to_checksum_address("0x" + bytes(result)[-20:].hex())
+    return None
+
+
+def _looks_like_amm_pool(w3, address: str, token_address: str) -> bool:
+    """Uniswap v2/v3 and Aerodrome pools expose token0()/token1(). If this
+    holder is a pool and one side is our token, it's the liquidity."""
+    try:
+        t0 = _read_address(w3, address, TOKEN0_DATA)
+        t1 = _read_address(w3, address, TOKEN1_DATA)
+    except Exception:
+        return False
+    if not t0 or not t1:
+        return False
+    return token_address.lower() in (t0.lower(), t1.lower())
+
+
+def classify_holder(w3, address: str, token_address: str) -> dict:
+    """Returns {"kind": burn|pool|contract|wallet|unknown, "label": str|None}."""
+    low = address.lower()
+    if low in BURN_ADDRESSES:
+        return {"kind": "burn", "label": "burn address"}
+    if low in KNOWN_POOL_SINGLETONS:
+        return {"kind": "pool", "label": KNOWN_POOL_SINGLETONS[low]}
+    try:
+        code = bytes(w3.eth.get_code(Web3.to_checksum_address(address)))
+    except Exception:
+        return {"kind": "unknown", "label": "could not read code"}
+    if len(code) == 0:
+        return {"kind": "wallet", "label": None}
+    # EIP-7702: an ordinary wallet that has delegated to a contract shows
+    # 0xef0100 + a 20-byte address (23 bytes). It's still a wallet.
+    if len(code) == 23 and code[:3] == b"\xef\x01\x00":
+        return {"kind": "wallet", "label": "EIP-7702 delegated wallet"}
+    if _looks_like_amm_pool(w3, address, token_address):
+        return {"kind": "pool", "label": "AMM pool"}
+    return {"kind": "contract", "label": None}
 
 
 def get_holder_concentration(w3, token_address: str) -> dict:
     """
     Returns:
-      ok=True:  {"ok": True, "top_holder_address": str,
-                 "top_holder_is_contract": bool, "top_holder_pct": float,
-                 "approximate": bool}  # True if the scan window was hit
-                                        # before covering full history
+      ok=True:  {"ok": True,
+                 "holders": [{"address", "pct", "kind", "label"}, ...],  # top N by REAL balance
+                 "top_holder_address", "top_holder_is_contract", "top_holder_pct",  # kept for callers
+                 "approximate": bool}
       ok=False: {"ok": False, "reason": str}
     """
     target = Web3.to_checksum_address(token_address)
 
     try:
-        contract = w3.eth.contract(address=target, abi=ERC20_MINIMAL_ABI)
-        total_supply_raw = contract.functions.totalSupply().call()
+        token = w3.eth.contract(address=target, abi=ERC20_ABI)
+        total_supply = token.functions.totalSupply().call()
     except Exception as e:
         return {"ok": False, "reason": f"totalSupply call failed: {e}"}
-
-    if total_supply_raw <= 0:
+    if total_supply <= 0:
         return {"ok": False, "reason": "total supply is zero"}
 
     logs, complete, any_chunk_succeeded = _fetch_transfer_logs(w3, target)
-
     if not logs:
         if not any_chunk_succeeded:
             return {"ok": False, "reason": "could not fetch transfer logs from RPC (all chunk requests failed -- check RPC_URL / rate limits)"}
         return {"ok": False, "reason": "no Transfer events found in scan window"}
 
-    balances = {}
+    # Logs only DISCOVER candidates (rough net flow), they don't decide balances.
+    flow = {}
     for log in logs:
         try:
             from_addr = Web3.to_checksum_address("0x" + bytes(log["topics"][1])[-20:].hex())
@@ -97,28 +182,52 @@ def get_holder_concentration(w3, token_address: str) -> dict:
         except Exception:
             continue
         if from_addr != ZERO_ADDRESS:
-            balances[from_addr] = balances.get(from_addr, 0) - amount
+            flow[from_addr] = flow.get(from_addr, 0) - amount
         if to_addr != ZERO_ADDRESS:
-            balances[to_addr] = balances.get(to_addr, 0) + amount
+            flow[to_addr] = flow.get(to_addr, 0) + amount
 
-    if not balances:
-        return {"ok": False, "reason": "could not reconstruct any balances from logs"}
+    ranked = sorted(flow.items(), key=lambda kv: kv[1], reverse=True)
+    candidates = [addr for addr, net in ranked if net > 0][:CANDIDATES_TO_READ]
+    for known in KNOWN_POOL_SINGLETONS:  # always look at the shared liquidity holders
+        cs = Web3.to_checksum_address(known)
+        if cs not in candidates and cs in flow:
+            candidates.append(cs)
+    for burn in BURN_ADDRESSES:
+        cs = Web3.to_checksum_address(burn)
+        if cs not in candidates and cs in flow:
+            candidates.append(cs)
+    if not candidates:
+        return {"ok": False, "reason": "no candidate holders found in scan window"}
 
-    top_address, top_balance = max(balances.items(), key=lambda kv: kv[1])
-    if top_balance <= 0:
-        return {"ok": False, "reason": "reconstructed top balance is zero or negative -- scan window likely incomplete"}
+    # Real, current balances -- correct for reflection tokens too.
+    real = []
+    for addr in candidates:
+        try:
+            bal = token.functions.balanceOf(addr).call()
+        except Exception:
+            continue
+        if bal > 0:
+            real.append((addr, bal))
+    if not real:
+        return {"ok": False, "reason": "could not read any candidate balances"}
+    real.sort(key=lambda kv: kv[1], reverse=True)
 
-    pct = (top_balance / total_supply_raw) * 100
+    holders = []
+    for addr, bal in real[:TOP_N]:
+        info = classify_holder(w3, addr, target)
+        holders.append({
+            "address": addr,
+            "pct": (bal / total_supply) * 100,
+            "kind": info["kind"],
+            "label": info["label"],
+        })
 
-    try:
-        is_contract = len(w3.eth.get_code(top_address)) > 0
-    except Exception as e:
-        return {"ok": False, "reason": f"eth_getCode failed for top holder: {e}"}
-
+    top = holders[0]
     return {
         "ok": True,
-        "top_holder_address": top_address,
-        "top_holder_is_contract": is_contract,
-        "top_holder_pct": pct,
+        "holders": holders,
+        "top_holder_address": top["address"],
+        "top_holder_is_contract": top["kind"] in ("contract", "pool"),
+        "top_holder_pct": top["pct"],
         "approximate": not complete,
     }
