@@ -26,9 +26,19 @@ Steps:
      and scans that -- otherwise you'd just be scanning a thin proxy
      stub that never shows the real function set.
 
-  2. Top holder concentration: top holder is a contract (not an EOA) and
-     holds between MIN_HOLDER_PCT and MAX_HOLDER_PCT of supply. Needs
-     ETHERSCAN_API_KEY (Pro plan) -- see refraction_holders.py.
+  2. Holder concentration + staking-contract discovery (redesigned --
+     see refraction_holders.py for why the old "top holder is a
+     contract, 30-70%" test was misfiring). Top holders are classified
+     burn / pool / contract / wallet. The gate FAILS only when a
+     non-burn, non-pool holder owns more than MAX_NONPOOL_HOLDER_PCT of
+     supply; pools and burns are ignored here (whether pool concentration
+     is good or bad depends on the LP lock, checked separately). There
+     is no minimum -- a brand-new token with nothing staked yet is fine.
+     Every holder that is a plain "contract" is ALSO scanned as a
+     candidate staking/vault contract (_find_staking_holder). This is
+     where real staking contracts get found: they are usually SEPARATE
+     contracts from the token, so scanning only the token's own bytecode
+     (all this check used to do) could never find one.
 
   3. Reward token is a mainstream asset (USDC / WETH / cbBTC on Base),
      read from the contract's rewardsToken()/rewardToken() accessor.
@@ -140,9 +150,45 @@ CLASSIC_REFLECTION_SIGNATURES = [
     "excludeFromReward(address)",
     "includeInReward(address)",
     "isExcludedFromReward(address)",
+    # Original Reflect.Finance naming (checked against its published
+    # source) -- forks are inconsistent; some keep this pair, some use
+    # the ...Reward pair above, so both are scanned.
+    "excludeAccount(address)",
+    "includeAccount(address)",
+    "isExcluded(address)",
     "totalFees()",
 ]
-CLASSIC_REFLECTION_MIN_MATCHES = 2  # informational threshold, deliberately looser than the strict gates
+# The two conversion functions are the distinctive part of the pattern
+# (they exist because balances are stored as "reflections" and converted
+# on read). Requiring at least one of them, on top of 2+ total matches,
+# keeps generic tax tokens that merely share names like totalFees() or
+# isExcluded() from being mislabeled as reflection tokens.
+CLASSIC_REFLECTION_CORE = ("reflectionFromToken(uint256,bool)", "tokenFromReflection(uint256)")
+CLASSIC_REFLECTION_MIN_MATCHES = 2
+
+# Dividend-paying tokens -- the pattern behind "hold this token, earn BTC /
+# ETH / USDC / BUSD" contracts. Unlike classic reflection (which pays you
+# more of the SAME token by inflating your balance), these pay a SEPARATE
+# asset that the holder withdraws. Based on Roger Wu's ERC-1726 draft
+# ("Dividend-Paying Token Standard": dividendOf, distributeDividends,
+# withdrawDividend) plus its widely copied optional interface
+# (withdrawableDividendOf, withdrawnDividendOf, accumulativeDividendOf).
+# ERC-1726 was never finalized -- it stayed a Draft -- but the reference
+# implementation is copied into a huge number of reward tokens. Some forks
+# add a reward-token argument to support several payout assets, so those
+# signatures are scanned too. Signatures checked against published source.
+DIVIDEND_SIGNATURES = [
+    "withdrawDividend()",
+    "withdrawDividend(address)",
+    "dividendOf(address)",
+    "dividendOf(address,address)",
+    "distributeDividends()",
+    "withdrawableDividendOf(address)",
+    "withdrawnDividendOf(address)",
+    "accumulativeDividendOf(address)",
+]
+DIVIDEND_CORE = ("withdrawDividend()", "withdrawDividend(address)")  # the "pull your payout" call
+DIVIDEND_MIN_MATCHES = 2
 
 ADMIN_RISK_SIGNATURES = [
     "owner()",
@@ -182,8 +228,13 @@ REQUIRE_REWARD_TOKEN = _env_flag("REFRACTION_REQUIRE_REWARD_TOKEN", "1")
 REQUIRE_AERODROME_GAUGE = _env_flag("REFRACTION_REQUIRE_AERODROME_GAUGE", "0")
 REQUIRE_NO_ADMIN_KEYS = _env_flag("REFRACTION_REQUIRE_NO_ADMIN_KEYS", "1")
 REQUIRE_NO_INFLATION_RISK = _env_flag("REFRACTION_REQUIRE_NO_INFLATION_RISK", "1")
-MIN_HOLDER_PCT = float(os.environ.get("REFRACTION_MIN_HOLDER_PCT", "30"))
-MAX_HOLDER_PCT = float(os.environ.get("REFRACTION_MAX_HOLDER_PCT", "70"))
+# Largest share any single holder may own UNLESS it has a legitimate
+# reason to (burn address, liquidity pool, or a discovered staking/vault
+# contract). Default 5%. No minimum: a fresh token with nothing staked
+# yet must not fail for that. Loosen with REFRACTION_MAX_NONPOOL_HOLDER_PCT.
+MAX_NONPOOL_HOLDER_PCT = float(os.environ.get("REFRACTION_MAX_NONPOOL_HOLDER_PCT", "5"))
+# Also scan top-holder contracts for a Synthetix/ERC-4626 mechanism.
+SCAN_HOLDER_CONTRACTS = _env_flag("REFRACTION_SCAN_HOLDER_CONTRACTS", "1")
 
 
 def _selector(signature: str) -> str:
@@ -256,7 +307,120 @@ def _check_admin_risk(bytecode_hex: str) -> dict:
 def _check_classic_reflection(bytecode_hex: str) -> dict:
     matches = _match_function_set(bytecode_hex, CLASSIC_REFLECTION_SIGNATURES)
     found = [sig for sig, present in matches.items() if present]
-    return {"detected": len(found) >= CLASSIC_REFLECTION_MIN_MATCHES, "matched_selectors": found}
+    has_core = any(sig in found for sig in CLASSIC_REFLECTION_CORE)
+    return {
+        "detected": len(found) >= CLASSIC_REFLECTION_MIN_MATCHES and has_core,
+        "matched_selectors": found,
+    }
+
+
+def _find_embedded_reward_assets(bytecode_hex: str) -> list:
+    """Compiled code never contains the word "WBTC" -- but a hardcoded /
+    immutable / constant reward asset is baked into the bytecode as its
+    20-byte ADDRESS, so scan for the known payout assets' addresses. Misses
+    reward tokens that are set at deploy time and kept in storage; and an
+    address in the code proves the contract REFERENCES that asset (e.g. WETH
+    shows up in any swap logic), not that it pays it -- so this is only
+    reported alongside a detected dividend pattern."""
+    haystack = bytecode_hex.lower()
+    return [label for addr, label in MAINSTREAM_REWARD_TOKENS.items() if addr[2:].lower() in haystack]
+
+
+def _check_dividend_pattern(bytecode_hex: str) -> dict:
+    matches = _match_function_set(bytecode_hex, DIVIDEND_SIGNATURES)
+    found = [sig for sig, present in matches.items() if present]
+    has_core = any(sig in found for sig in DIVIDEND_CORE)
+    detected = len(found) >= DIVIDEND_MIN_MATCHES and has_core
+    return {
+        "detected": detected,
+        "matched_selectors": found,
+        "embedded_reward_assets": _find_embedded_reward_assets(bytecode_hex) if detected else [],
+    }
+
+
+def _read_address_accessor(address: str, signature: str):
+    """Call a no-argument view that returns an address (stakingToken(),
+    asset(), ...). Returns a checksummed address, or None if the function
+    is missing, the call failed, or it returned the zero address."""
+    try:
+        data = bytes(Web3.keccak(text=signature))[:4]
+        result = w3.eth.call({"to": address, "data": data})
+    except Exception:
+        return None
+    if len(result) < 32:
+        return None
+    candidate = Web3.to_checksum_address("0x" + bytes(result)[-20:].hex())
+    return None if candidate == Web3.to_checksum_address(ZERO_ADDRESS) else candidate
+
+
+def _staking_link(address: str, pattern: str, target: str):
+    """Does this candidate staking/vault contract actually work with OUR
+    token? True (its stakingToken()/asset() is our token), False (it's
+    for a different token), or None (accessor missing -- can't tell)."""
+    signature = "asset()" if pattern == "erc4626" else "stakingToken()"
+    linked_to = _read_address_accessor(address, signature)
+    if linked_to is None:
+        return None
+    return linked_to == target
+
+
+def _find_staking_holder(holders: dict, target: str):
+    """
+    Scan each top holder classified as a plain 'contract' for a Synthetix
+    or ERC-4626 reward mechanism. A real staking contract is usually a
+    SEPARATE contract from the token and holds the staked tokens, so it
+    shows up in the holder list -- scanning only the token's own bytecode
+    can never find it. Candidates that positively link to a DIFFERENT
+    token are skipped. Returns the best candidate dict, or None.
+    """
+    best = None
+    for h in holders.get("holders", []):
+        if h.get("kind") != "contract":
+            continue
+        addr = Web3.to_checksum_address(h["address"])
+        try:
+            logic = _resolve_logic_address(addr)
+            iface = _interface_match(_get_bytecode_hex(logic))
+        except Exception:
+            continue
+        if not iface["is_match"]:
+            continue
+        linked = _staking_link(addr, iface["pattern"], target)
+        if linked is False:
+            continue
+        candidate = {
+            "address": addr,
+            "pattern": iface["pattern"],
+            "iface": iface,
+            "linked": linked,
+            "holder_pct": h["pct"],
+        }
+        # Prefer a verified link to our token, then the larger stake.
+        if best is None or (linked is True, h["pct"]) > (best["linked"] is True, best["holder_pct"]):
+            best = candidate
+    return best
+
+
+def _evaluate_holder_gate(holders: dict, exempt_address=None) -> bool:
+    """
+    Passes unless a non-burn, non-pool holder owns more than
+    MAX_NONPOOL_HOLDER_PCT. Burns and pools are ignored (pool
+    concentration is judged by the LP-lock check, not here). There is
+    deliberately NO minimum. A discovered staking contract is exempt --
+    lots of supply sitting in the reward contract is the point, not a
+    risk.
+    """
+    if not holders.get("ok"):
+        return False
+    exempt = exempt_address.lower() if exempt_address else None
+    for h in holders.get("holders", []):
+        if h["kind"] in ("burn", "pool"):
+            continue
+        if exempt and h["address"].lower() == exempt:
+            continue
+        if h["pct"] > MAX_NONPOOL_HOLDER_PCT:
+            return False
+    return True
 
 
 def summarize_reflection(result: dict) -> str:
@@ -272,12 +436,26 @@ def summarize_reflection(result: dict) -> str:
     reward = result["detail"]["reward"]
     classic = result["detail"].get("classic_reflection", {})
 
+    mechanism = result["detail"].get("mechanism") or {}
+
     if interface.get("is_match"):
         pattern_label = "ERC-4626 vault" if interface["pattern"] == "erc4626" else "Synthetix staking"
+        if mechanism.get("where") == "holder_contract":
+            addr = mechanism["address"]
+            link = {True: "confirmed for this token", False: "", None: "link to this token unverified"}[mechanism.get("linked")]
+            pattern_label += f" via separate contract {addr[:8]}…{addr[-4:]}" + (f" ({link})" if link else "")
         if reward.get("ok") and reward.get("reward_token"):
             payout = reward["label"] if reward.get("label") else (f"unlabeled asset ({reward['reward_token']})" if not reward.get("is_mainstream") else reward["reward_token"])
             return f"reflection: {pattern_label} — pays {payout}"
         return f"reflection: {pattern_label} — reward token undetermined"
+
+    dividend = result["detail"].get("dividend", {})
+    if dividend.get("detected"):
+        assets = dividend.get("embedded_reward_assets") or []
+        paid = (f"address found in code: {', '.join(assets)}" if assets
+                else "payout asset not visible in code -- likely set at deploy time, read the contract")
+        return (f"reflection: dividend-paying pattern ({', '.join(dividend['matched_selectors'])}) "
+                f"— pays a separate asset; {paid}")
 
     if classic.get("detected"):
         return f"reflection: classic pattern ({', '.join(classic['matched_selectors'])}) — pays in itself, not a genuine external asset"
@@ -360,19 +538,32 @@ def check_refraction(address: str) -> dict:
     logic_address = _resolve_logic_address(target)
     bytecode_hex = _get_bytecode_hex(logic_address)
 
-    interface = _interface_match(bytecode_hex)
+    own_interface = _interface_match(bytecode_hex)
     holders = get_holder_concentration(w3, target)
-    reward = _get_reward_token(logic_address, target)
+
+    # Where does the reward mechanism live? Often in a SEPARATE contract
+    # from the token, so if the token itself doesn't match, look at the
+    # top holders too (see _find_staking_holder).
+    mechanism = {"where": "token", "address": target, "linked": None}
+    interface = own_interface
+    staking = None
+    if not own_interface["is_match"] and SCAN_HOLDER_CONTRACTS and holders.get("ok"):
+        staking = _find_staking_holder(holders, target)
+        if staking:
+            interface = staking["iface"]
+            mechanism = {"where": "holder_contract", "address": staking["address"], "linked": staking["linked"]}
+
+    # Accessor calls must go to the address that holds the STORAGE (the
+    # proxy / original address), not the implementation behind it --
+    # calling an implementation directly reads its empty storage.
+    reward = _get_reward_token(mechanism["address"], target)
     is_gauge = _is_aerodrome_gauge(target)
     admin_risk = _check_admin_risk(bytecode_hex)
-    vault_risk = _check_vault_liquidity_risk(logic_address, interface["pattern"])
+    vault_risk = _check_vault_liquidity_risk(mechanism["address"], interface["pattern"])
     classic_reflection = _check_classic_reflection(bytecode_hex)
+    dividend = _check_dividend_pattern(bytecode_hex)
 
-    holder_pass = (
-        holders["ok"]
-        and holders["top_holder_is_contract"]
-        and MIN_HOLDER_PCT <= holders["top_holder_pct"] <= MAX_HOLDER_PCT
-    )
+    holder_pass = _evaluate_holder_gate(holders, exempt_address=staking["address"] if staking else None)
 
     # Not applicable (Synthetix-pattern) or the read failed -> don't penalize;
     # only fail this step when we positively confirmed low supply.
@@ -409,5 +600,7 @@ def check_refraction(address: str) -> dict:
             "admin_risk": admin_risk,
             "vault_risk": vault_risk,
             "classic_reflection": classic_reflection,
+            "mechanism": mechanism,
+            "dividend": dividend,
         },
     }
