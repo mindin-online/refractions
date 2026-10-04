@@ -85,6 +85,8 @@ import os
 from web3 import Web3
 
 from refraction_holders import get_holder_concentration
+from refraction_autonomy import analyze_autonomy
+from refraction_payouts import verify_payouts, verify_vault_yield
 
 RPC_URL = os.environ.get("RPC_URL", "https://mainnet.base.org")
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
@@ -125,7 +127,11 @@ ERC4626_SIGNATURES = [
     "redeem(uint256,address,address)",
 ]
 
-REWARD_TOKEN_ACCESSORS = ["rewardsToken()", "rewardToken()"]
+REWARD_TOKEN_ACCESSORS = [
+    "rewardsToken()", "rewardToken()",
+    # dividend-tracker / fork variants (names seen in published templates)
+    "dividendToken()", "rewardTokenAddress()", "getRewardToken()", "payoutToken()", "getPayoutToken()",
+]
 
 # Classic "reflection" pattern (RFI, then SafeMoon and hundreds of direct
 # forks) -- architecturally nothing like Synthetix/ERC-4626. No separate
@@ -189,6 +195,19 @@ DIVIDEND_SIGNATURES = [
 ]
 DIVIDEND_CORE = ("withdrawDividend()", "withdrawDividend(address)")  # the "pull your payout" call
 DIVIDEND_MIN_MATCHES = 2
+# Tracker-style tokens (BABYDOGE-lineage forks: DeFi-IRA, BasePrinter, ...)
+# keep the pay-out machinery in a SEPARATE tracker contract and only expose
+# forwarders on the token, so the ERC-1726 core above may not be in the
+# token's own code. These selectors identify a tracker.
+TRACKER_SIGNATURES = [
+    "process(uint256)",
+    "getNumberOfTokenHolders()",
+    "getAccountAtIndex(uint256)",
+    "setBalance(address,uint256)",
+    "claimWait()",
+    "withdrawableDividendOf(address)",
+    "minimumTokenBalanceForDividends()",
+]
 
 ADMIN_RISK_SIGNATURES = [
     "owner()",
@@ -226,7 +245,16 @@ REQUIRE_INTERFACE = _env_flag("REFRACTION_REQUIRE_INTERFACE", "1")
 REQUIRE_HOLDER_CONCENTRATION = _env_flag("REFRACTION_REQUIRE_HOLDER_CONCENTRATION", "1")
 REQUIRE_REWARD_TOKEN = _env_flag("REFRACTION_REQUIRE_REWARD_TOKEN", "1")
 REQUIRE_AERODROME_GAUGE = _env_flag("REFRACTION_REQUIRE_AERODROME_GAUGE", "0")
-REQUIRE_NO_ADMIN_KEYS = _env_flag("REFRACTION_REQUIRE_NO_ADMIN_KEYS", "1")
+# no_admin_keys is now an informational/bonus signal by default. As a hard gate
+# it could only ever pass contracts that never had an owner (renounceOwnership()
+# is in the bytecode of every OpenZeppelin Ownable token even AFTER the owner
+# renounced). The real question -- does anyone still hold the levers -- is the
+# autonomy_ok gate below, which reads live owner state.
+REQUIRE_NO_ADMIN_KEYS = _env_flag("REFRACTION_REQUIRE_NO_ADMIN_KEYS", "0")
+REQUIRE_AUTONOMY = _env_flag("REFRACTION_REQUIRE_AUTONOMY", "1")
+REQUIRE_PAYOUT_PROOF = _env_flag("REFRACTION_REQUIRE_PAYOUT_PROOF", "1")
+ALLOW_CONSTRAINED = _env_flag("REFRACTION_ALLOW_CONSTRAINED", "0")
+ALLOW_EVENT_ONLY = _env_flag("REFRACTION_ALLOW_EVENT_ONLY_PROOF", "0")
 REQUIRE_NO_INFLATION_RISK = _env_flag("REFRACTION_REQUIRE_NO_INFLATION_RISK", "1")
 # Largest share any single holder may own UNLESS it has a legitimate
 # reason to (burn address, liquidity pool, or a discovered staking/vault
@@ -330,7 +358,12 @@ def _check_dividend_pattern(bytecode_hex: str) -> dict:
     matches = _match_function_set(bytecode_hex, DIVIDEND_SIGNATURES)
     found = [sig for sig, present in matches.items() if present]
     has_core = any(sig in found for sig in DIVIDEND_CORE)
-    detected = len(found) >= DIVIDEND_MIN_MATCHES and has_core
+    t_matches = _match_function_set(bytecode_hex, TRACKER_SIGNATURES)
+    t_found = [sig for sig, present in t_matches.items() if present]
+    erc1726_style = len(found) >= DIVIDEND_MIN_MATCHES and has_core
+    tracker_style = len(t_found) >= 3 and "withdrawableDividendOf(address)" in t_found
+    detected = erc1726_style or tracker_style
+    found = found + [sig for sig in t_found if sig not in found]
     return {
         "detected": detected,
         "matched_selectors": found,
@@ -425,37 +458,52 @@ def _evaluate_holder_gate(holders: dict, exempt_address=None) -> bool:
 
 def summarize_reflection(result: dict) -> str:
     """
-    One-line, human-readable answer to "does this pay reflections, and
-    in what" -- built from a full check_refraction() result. Used
-    everywhere this needs to be shown (!check, !rlog, digest, real-time
-    alerts) so the wording only lives in one place. Reports on EVERY
-    candidate regardless of passes_all, since this is diagnostic, not
-    gating.
+    One-line, human-readable answer to "does this pay reflections, and in
+    what" -- built from a full check_refraction() result. Used everywhere
+    this needs to be shown (!check, !rlog, digest, alerts) so the wording
+    only lives in one place. Reports on EVERY candidate regardless of
+    passes_all, since this is diagnostic, not gating.
     """
-    interface = result["detail"]["interface"]
-    reward = result["detail"]["reward"]
-    classic = result["detail"].get("classic_reflection", {})
+    d = result["detail"]
+    interface, reward = d["interface"], d["reward"]
+    classic = d.get("classic_reflection", {})
+    mechanism = d.get("mechanism") or {}
+    dividend = d.get("dividend", {})
+    payouts = d.get("payouts") or {}
+    autonomy = d.get("autonomy") or {}
 
-    mechanism = result["detail"].get("mechanism") or {}
+    tail = ""
+    if payouts.get("ran"):
+        tail += f" · payouts {payouts['proof']}"
+    if autonomy.get("level"):
+        tail += f" · {autonomy['level']}"
 
     if interface.get("is_match"):
-        pattern_label = "ERC-4626 vault" if interface["pattern"] == "erc4626" else "Synthetix staking"
+        label = {"erc4626": "ERC-4626 vault", "synthetix": "Synthetix staking",
+                 "dividend": "dividend-paying token"}.get(interface["pattern"], interface["pattern"])
         if mechanism.get("where") == "holder_contract":
             addr = mechanism["address"]
             link = {True: "confirmed for this token", False: "", None: "link to this token unverified"}[mechanism.get("linked")]
-            pattern_label += f" via separate contract {addr[:8]}…{addr[-4:]}" + (f" ({link})" if link else "")
+            label += f" via separate contract {addr[:8]}…{addr[-4:]}" + (f" ({link})" if link else "")
+        elif mechanism.get("where") == "tracker":
+            addr = mechanism["address"]
+            label += f" via tracker {addr[:8]}…{addr[-4:]}"
         if reward.get("ok") and reward.get("reward_token"):
-            payout = reward["label"] if reward.get("label") else (f"unlabeled asset ({reward['reward_token']})" if not reward.get("is_mainstream") else reward["reward_token"])
-            return f"reflection: {pattern_label} — pays {payout}"
-        return f"reflection: {pattern_label} — reward token undetermined"
+            payout = reward["label"] if reward.get("label") else (
+                f"unlabeled asset ({reward['reward_token']})" if not reward.get("is_mainstream") else reward["reward_token"])
+            if reward.get("observed"):
+                payout += " (observed in payouts)"
+            return f"reflection: {label} — pays {payout}{tail}"
+        assets = dividend.get("embedded_reward_assets") or []
+        hint = f"; code references {', '.join(assets)}" if assets else ""
+        return f"reflection: {label} — reward asset undetermined{hint}{tail}"
 
-    dividend = result["detail"].get("dividend", {})
     if dividend.get("detected"):
         assets = dividend.get("embedded_reward_assets") or []
         paid = (f"address found in code: {', '.join(assets)}" if assets
                 else "payout asset not visible in code -- likely set at deploy time, read the contract")
         return (f"reflection: dividend-paying pattern ({', '.join(dividend['matched_selectors'])}) "
-                f"— pays a separate asset; {paid}")
+                f"— pays a separate asset; {paid}{tail}")
 
     if classic.get("detected"):
         return f"reflection: classic pattern ({', '.join(classic['matched_selectors'])}) — pays in itself, not a genuine external asset"
@@ -528,11 +576,48 @@ def _check_vault_liquidity_risk(address: str, pattern: str) -> dict:
     }
 
 
+def _find_dividend_tracker(token_address: str, bytecode_hex: str):
+    """Tracker-style dividend tokens expose dividendTracker() on the token.
+    Returns (tracker_address | None, tracker_logic_bytecode_hex)."""
+    if _selector("dividendTracker()") not in bytecode_hex:
+        return None, ""
+    tracker = _read_address_accessor(token_address, "dividendTracker()")
+    if not tracker:
+        return None, ""
+    try:
+        return tracker, _get_bytecode_hex(_resolve_logic_address(tracker))
+    except Exception:
+        return tracker, ""
+
+
+def _resolve_reward(addresses: list, target: str, pattern):
+    """Read the reward asset from the first contract that names one.
+    ERC-4626 vaults have no 'reward token' -- yield accrues in asset()."""
+    for a in addresses:
+        r = _get_reward_token(a, target)
+        if r["ok"]:
+            return r
+    if pattern == "erc4626":
+        for a in addresses:
+            asset = _read_address_accessor(a, "asset()")
+            if asset:
+                if asset == target:
+                    return {"ok": True, "reward_token": asset, "is_mainstream": False,
+                            "label": "pays in itself -- not an external asset", "via": "asset()"}
+                label = MAINSTREAM_REWARD_TOKENS.get(asset)
+                return {"ok": True, "reward_token": asset, "is_mainstream": label is not None, "label": label, "via": "asset()"}
+    return {"ok": False, "reward_token": None, "is_mainstream": False, "label": None}
+
+
 def check_refraction(address: str) -> dict:
     """
     Runs every step regardless of which are required, so you always get
     full diagnostic info back -- then applies the configured hard gates
     (REFRACTION_REQUIRE_* env vars) to decide passes_all.
+
+    Expensive work (autonomy reads, payout-log scans) runs ONLY when a
+    qualifying pattern was found, so the vast majority of scanned tokens
+    never pay for it.
     """
     target = Web3.to_checksum_address(address)
     logic_address = _resolve_logic_address(target)
@@ -541,33 +626,94 @@ def check_refraction(address: str) -> dict:
     own_interface = _interface_match(bytecode_hex)
     holders = get_holder_concentration(w3, target)
 
+    tracker_addr, tracker_code = _find_dividend_tracker(target, bytecode_hex)
+    dividend = _check_dividend_pattern(bytecode_hex + tracker_code)
+
     # Where does the reward mechanism live? Often in a SEPARATE contract
     # from the token, so if the token itself doesn't match, look at the
     # top holders too (see _find_staking_holder).
-    mechanism = {"where": "token", "address": target, "linked": None}
+    mechanism = {"where": "token", "address": target, "linked": None, "tracker": tracker_addr}
     interface = own_interface
     staking = None
     if not own_interface["is_match"] and SCAN_HOLDER_CONTRACTS and holders.get("ok"):
         staking = _find_staking_holder(holders, target)
         if staking:
             interface = staking["iface"]
-            mechanism = {"where": "holder_contract", "address": staking["address"], "linked": staking["linked"]}
+            mechanism = {"where": "holder_contract", "address": staking["address"],
+                         "linked": staking["linked"], "tracker": tracker_addr}
+
+    # Dividend-paying tokens are a third qualifying pattern.
+    if not interface["is_match"] and dividend["detected"]:
+        interface = {"is_match": True, "pattern": "dividend",
+                     "synthetix": own_interface["synthetix"], "erc4626": own_interface["erc4626"]}
+        mechanism = {"where": "tracker" if tracker_addr else "token", "address": tracker_addr or target,
+                     "linked": None, "tracker": tracker_addr}
+
+    pattern = interface["pattern"] if interface["is_match"] else None
 
     # Accessor calls must go to the address that holds the STORAGE (the
     # proxy / original address), not the implementation behind it --
     # calling an implementation directly reads its empty storage.
-    reward = _get_reward_token(mechanism["address"], target)
+    reward_sources = [mechanism["address"]] + ([target] if mechanism["address"] != target else [])
+    reward = _resolve_reward(reward_sources, target, pattern)
     is_gauge = _is_aerodrome_gauge(target)
     admin_risk = _check_admin_risk(bytecode_hex)
     vault_risk = _check_vault_liquidity_risk(mechanism["address"], interface["pattern"])
     classic_reflection = _check_classic_reflection(bytecode_hex)
-    dividend = _check_dividend_pattern(bytecode_hex)
+
+    autonomy = payouts = None
+    if pattern:
+        scope = [{"address": target, "role": "token", "bytecode_hex": bytecode_hex}]
+        if mechanism["address"] != target:
+            try:
+                scope.append({
+                    "address": mechanism["address"],
+                    "role": "tracker" if mechanism["where"] == "tracker" else "mechanism",
+                    "bytecode_hex": _get_bytecode_hex(_resolve_logic_address(mechanism["address"])),
+                })
+            except Exception:
+                pass
+        if tracker_addr and tracker_addr != mechanism["address"] and tracker_code:
+            scope.append({"address": tracker_addr, "role": "tracker", "bytecode_hex": tracker_code})
+        autonomy = analyze_autonomy(w3, scope, pattern)
+
+        if pattern == "erc4626":
+            payouts = verify_vault_yield(w3, mechanism["address"])
+        else:
+            payers = [mechanism["address"]]
+            if pattern == "dividend":
+                payers.append(target)
+                if tracker_addr:
+                    payers.append(tracker_addr)
+            if reward.get("ok") and reward.get("reward_token") and reward["reward_token"] != target:
+                assets = {reward["reward_token"]: reward.get("label") or reward["reward_token"]}
+            else:
+                assets = dict(MAINSTREAM_REWARD_TOKENS)
+            payouts = verify_payouts(w3, target, payers, assets)
+
+            # If the contract never named its reward asset, the payouts
+            # themselves can: whichever asset actually went out to holders.
+            observed = payouts.get("reward_asset_observed")
+            if not reward.get("ok") and observed:
+                lab = MAINSTREAM_REWARD_TOKENS.get(Web3.to_checksum_address(observed["address"]))
+                reward = {"ok": True, "reward_token": observed["address"], "is_mainstream": lab is not None,
+                          "label": lab, "observed": True}
+
+            # One or two senders pushing payouts = a person is distributing.
+            if payouts["trigger"]["verdict"] == "manual_push" and autonomy["level"] != "managed":
+                autonomy["live_levers"].append("payouts are pushed by one or two senders -- a person is distributing them")
+                autonomy["level"] = "managed"
 
     holder_pass = _evaluate_holder_gate(holders, exempt_address=staking["address"] if staking else None)
 
     # Not applicable (Synthetix-pattern) or the read failed -> don't penalize;
     # only fail this step when we positively confirmed low supply.
     vault_supply_safe = not (vault_risk.get("applicable") and vault_risk.get("ok") and vault_risk.get("inflation_risk"))
+
+    autonomy_ok = bool(autonomy and (autonomy["level"] == "autonomous"
+                                     or (autonomy["level"] == "constrained" and ALLOW_CONSTRAINED)))
+    proof = payouts["proof"] if payouts else None
+    payout_proven = bool(proof == "strong" or (proof in ("events_only", "drift_only") and ALLOW_EVENT_ONLY))
 
     steps = {
         "interface_match": interface["is_match"],
@@ -576,6 +722,8 @@ def check_refraction(address: str) -> dict:
         "aerodrome_gauge": is_gauge,
         "no_admin_keys": admin_risk["no_admin_keys"],
         "vault_supply_safe": vault_supply_safe,
+        "autonomy_ok": autonomy_ok,
+        "payout_proven": payout_proven,
     }
     gates = {
         "interface_match": REQUIRE_INTERFACE,
@@ -584,6 +732,8 @@ def check_refraction(address: str) -> dict:
         "aerodrome_gauge": REQUIRE_AERODROME_GAUGE,
         "no_admin_keys": REQUIRE_NO_ADMIN_KEYS,
         "vault_supply_safe": REQUIRE_NO_INFLATION_RISK,
+        "autonomy_ok": REQUIRE_AUTONOMY,
+        "payout_proven": REQUIRE_PAYOUT_PROOF,
     }
     passes_all = all(steps[k] for k, required in gates.items() if required)
 
@@ -602,5 +752,7 @@ def check_refraction(address: str) -> dict:
             "classic_reflection": classic_reflection,
             "mechanism": mechanism,
             "dividend": dividend,
+            "autonomy": autonomy,
+            "payouts": payouts,
         },
     }

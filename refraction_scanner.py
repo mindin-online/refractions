@@ -41,10 +41,11 @@ from datetime import datetime, timedelta, timezone
 import redis
 import requests
 
-from refraction_check import check_refraction, summarize_reflection
-from refraction_tax_check import check_transfer_tax
-from refraction_honeypot_check import check_honeypot
-from refraction_honeypot_is_check import check_honeypot_is
+from refraction_check import summarize_reflection
+from refraction_evaluate import fetch_market, evaluate_candidate, format_scorecard
+from refraction_score import has_reward_signal, short_tag
+from refraction_discovery import discover
+from refraction_watch import make_snapshot, save_position, watch_positions
 
 try:
     from base_buy import execute_buy
@@ -80,6 +81,12 @@ DAILY_COUNT_KEY = "refraction:daily_count"
 
 LOG_LIST_KEY = "refraction:log"          # profile-stream passes + near-misses, read by !rlog
 MOVERS_LOG_LIST_KEY = "refraction:movers_log"  # movers-scan passes + near-misses, read by !mlog
+SEARCH_LOG_LIST_KEY = "refraction:search_log"  # discovery-scan (keyword/established/trending), read by !dlog
+LAST_DISCOVERY_KEY = "refraction:last_discovery_scan_at"
+DISCOVERY_INTERVAL_SECONDS = int(os.environ.get("REFRACTION_DISCOVERY_INTERVAL_SECONDS", str(24 * 3600)))
+DISCOVERY_MAX_CANDIDATES = int(os.environ.get("REFRACTION_DISCOVERY_MAX_CANDIDATES", "60"))
+LAST_WATCH_KEY = "refraction:last_watch_at"
+WATCH_INTERVAL_SECONDS = int(os.environ.get("REFRACTION_WATCH_INTERVAL_SECONDS", "900"))
 LOG_LIST_MAX = 200
 LAST_DIGEST_KEY = "refraction:last_digest_at"
 CIRCUIT_BREAKER_KEY = "refraction:circuit_breaker"  # JSON: {tripped, reason, token, timestamp} or absent
@@ -118,14 +125,35 @@ def increment_daily_count():
     pipe.execute()
 
 
+def _chunk_for_discord(content: str, limit: int = 1900) -> list:
+    """Discord rejects any message over 2000 characters with a 400 -- which
+    this code used to ignore, silently losing the alert. Split on line
+    boundaries instead."""
+    chunks, cur, size = [], [], 0
+    for line in content.split("\n"):
+        while len(line) > limit:  # a single oversized line
+            if cur:
+                chunks.append("\n".join(cur)); cur, size = [], 0
+            chunks.append(line[:limit]); line = line[limit:]
+        if size + len(line) + 1 > limit and cur:
+            chunks.append("\n".join(cur)); cur, size = [], 0
+        cur.append(line); size += len(line) + 1
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks or [""]
+
+
 def notify_discord(content: str):
     if not DISCORD_WEBHOOK_URL:
         log.warning("DISCORD_WEBHOOK_URL not set, skipping alert: %s", content)
         return
-    try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=10)
-    except Exception as e:
-        log.error("Discord webhook failed: %s", e)
+    for chunk in _chunk_for_discord(content):
+        try:
+            resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": chunk}, timeout=10)
+            if resp.status_code >= 300:
+                log.error("Discord webhook returned %s: %s", resp.status_code, resp.text[:200])
+        except Exception as e:
+            log.error("Discord webhook failed: %s", e)
 
 
 def notify_email(subject: str, body: str):
@@ -165,29 +193,10 @@ def fetch_new_base_profiles():
 
 
 def get_pool_info(token_address: str) -> dict:
-    """Returns {'liquidity_usd': float, 'pool_address': str|None,
-    'buys24h': int, 'sells24h': int} for the deepest pair. buys24h/
-    sells24h feed the free "real buyers who could never sell" honeypot
-    signal below -- data DexScreener already returns in this same call,
-    ported from a working implementation that uses the GeckoTerminal
-    equivalent of this exact field."""
-    try:
-        resp = requests.get(DEXSCREENER_PAIRS_URL.format(token_address), timeout=15)
-        resp.raise_for_status()
-        pairs = resp.json()
-        if not pairs:
-            return {"liquidity_usd": 0.0, "pool_address": None, "buys24h": 0, "sells24h": 0}
-        best = max(pairs, key=lambda p: (p.get("liquidity", {}) or {}).get("usd", 0) or 0)
-        txns_h24 = (best.get("txns", {}) or {}).get("h24", {}) or {}
-        return {
-            "liquidity_usd": (best.get("liquidity", {}) or {}).get("usd", 0) or 0,
-            "pool_address": best.get("pairAddress"),
-            "buys24h": int(txns_h24.get("buys", 0) or 0),
-            "sells24h": int(txns_h24.get("sells", 0) or 0),
-        }
-    except Exception as e:
-        log.error("Pool info lookup failed for %s: %s", token_address, e)
-        return {"liquidity_usd": 0.0, "pool_address": None, "buys24h": 0, "sells24h": 0}
+    """Kept for the callers below; the real work lives in
+    refraction_evaluate.fetch_market (liquidity, pool address, buys/sells,
+    plus volume, market cap, FDV and pair age used for scoring)."""
+    return fetch_market(token_address)
 
 
 # Minimum buy sample before treating a zero-sells count as meaningful
@@ -290,28 +299,41 @@ def maybe_run_mover_scan():
         process_candidate(m["token_address"], source="mover")
 
 
-def log_candidate(token_address: str, result: dict, status: str, source: str = "profile"):
+def _log_key_for(source: str) -> str:
+    return {"mover": MOVERS_LOG_LIST_KEY, "search": SEARCH_LOG_LIST_KEY}.get(source, LOG_LIST_KEY)
+
+
+def log_candidate(token_address: str, ev: dict, status: str, source: str = "profile"):
     """status is 'pass' or 'near_miss'. source is 'profile' (new-token
-    stream) or 'mover' (top-movers scan) -- determines which Redis list
-    this goes to, so !rlog and !mlog can show genuinely separate views
-    instead of one shared feed with no way to tell them apart."""
-    log_key = MOVERS_LOG_LIST_KEY if source == "mover" else LOG_LIST_KEY
+    stream), 'mover' (top-movers scan) or 'search' (discovery scan) --
+    determines which Redis list this goes to, so !rlog / !mlog / !dlog show
+    genuinely separate views."""
+    result, sc, pool = ev["result"], ev["score"], ev["pool"]
     holders = result["detail"]["holders"]
     reward = result["detail"]["reward"]
+    d = result["detail"]
     entry = {
         "address": token_address,
         "timestamp": time.time(),
         "status": status,
         "steps": result["steps"],
-        "interface_pattern": result["detail"]["interface"].get("pattern"),
+        "missing": [k for k in result["gates_active"] if not result["steps"].get(k)],
+        "interface_pattern": d["interface"].get("pattern"),
         "holder_pct": holders.get("top_holder_pct") if holders.get("ok") else None,
         "reward_label": reward.get("label") if reward.get("ok") else None,
         "reward_token": reward.get("reward_token") if reward.get("ok") else None,
         "reflection_summary": summarize_reflection(result),
+        "score": sc["score"], "grade": sc["grade"], "partial": sc["partial"],
+        "buy_eligible": sc["buy_eligible"],
+        "autonomy": (d.get("autonomy") or {}).get("level"),
+        "payout_proof": (d.get("payouts") or {}).get("proof"),
+        "liquidity_usd": pool.get("liquidity_usd"),
+        "volume24h_usd": pool.get("volume24h_usd"),
     }
+    key = _log_key_for(source)
     pipe = r.pipeline()
-    pipe.rpush(log_key, json.dumps(entry))
-    pipe.ltrim(log_key, -LOG_LIST_MAX, -1)
+    pipe.rpush(key, json.dumps(entry))
+    pipe.ltrim(key, -LOG_LIST_MAX, -1)
     pipe.execute()
 
 
@@ -360,7 +382,8 @@ def clear_circuit_breaker():
 def maybe_send_digest():
     """Fires at most once per DIGEST_INTERVAL_SECONDS (default 12h). On
     the very first run it just records a start time rather than sending
-    an immediate (empty) digest."""
+    an immediate (empty) digest. Merges all three discovery logs, tags
+    each entry with where it came from, and lists the best-scoring first."""
     last = r.get(LAST_DIGEST_KEY)
     now = time.time()
     if last is None:
@@ -370,14 +393,15 @@ def maybe_send_digest():
     if now - last < DIGEST_INTERVAL_SECONDS:
         return
 
-    raw_entries = [(raw, "profile") for raw in r.lrange(LOG_LIST_KEY, 0, -1)]
-    raw_entries += [(raw, "mover") for raw in r.lrange(MOVERS_LOG_LIST_KEY, 0, -1)]
+    raw_entries = [(raw, "") for raw in r.lrange(LOG_LIST_KEY, 0, -1)]
+    raw_entries += [(raw, " (movers)") for raw in r.lrange(MOVERS_LOG_LIST_KEY, 0, -1)]
+    raw_entries += [(raw, " (discovery)") for raw in r.lrange(SEARCH_LOG_LIST_KEY, 0, -1)]
     entries = []
     for raw, src in raw_entries:
         try:
             e = json.loads(raw)
             if e["timestamp"] > last:
-                e["_source"] = src
+                e["_src"] = src
                 entries.append(e)
         except Exception:
             continue
@@ -389,19 +413,22 @@ def maybe_send_digest():
                     subject="Refraction digest — nothing found")
         return
 
+    entries.sort(key=lambda e: (e["status"] == "pass", e.get("score") or 0), reverse=True)
     passes = [e for e in entries if e["status"] == "pass"]
     near_misses = [e for e in entries if e["status"] == "near_miss"]
 
     lines = [f"📋 **Refraction digest** — {len(passes)} pass(es), {len(near_misses)} near-miss(es)"]
-    for e in passes:
-        reflection_note = f" — {e['reflection_summary']}" if e.get("reflection_summary") else ""
-        src_tag = " (movers)" if e["_source"] == "mover" else ""
-        lines.append(f"✅ `{e['address']}`{src_tag} — {e['interface_pattern'] or '?'} pattern{reflection_note}")
-    for e in near_misses:
-        gates_passed = [k for k, v in e["steps"].items() if v]
-        reflection_note = f" — {e['reflection_summary']}" if e.get("reflection_summary") else ""
-        src_tag = " (movers)" if e["_source"] == "mover" else ""
-        lines.append(f"🔸 `{e['address']}`{src_tag} — passed: {', '.join(gates_passed) or 'none'}{reflection_note}")
+    shown = 0
+    for e in entries:
+        if shown >= 15:
+            lines.append(f"…and {len(entries) - shown} more — see `!rlog`, `!mlog`, `!dlog`.")
+            break
+        tag = f" [{'~' if e.get('partial') else ''}{e['score']} {e['grade']}]" if e.get("score") is not None else ""
+        icon = "✅" if e["status"] == "pass" else "🔸"
+        miss = f" missing: {', '.join(e['missing'])}" if e.get("missing") and e["status"] != "pass" else ""
+        note = f" — {e['reflection_summary']}" if e.get("reflection_summary") else ""
+        lines.append(f"{icon} `{e['address']}`{e['_src']}{tag}{miss}{note}")
+        shown += 1
 
     notify_all("\n".join(lines), subject=f"Refraction digest — {len(passes)} pass, {len(near_misses)} near-miss")
 
@@ -430,11 +457,10 @@ def process_candidate(token_address: str, source: str = "profile"):
         return
     r.set(seen_key, "1", ex=SEEN_TTL)
 
-    # Cheap pre-filter, before spending any RPC calls on the real checks:
-    # real buyers who never once managed to sell is one of the strongest
-    # honeypot tells there is, and DexScreener already returns this data
-    # for free in the same lookup used for the liquidity check later.
-    early_pool_info = get_pool_info(token_address)
+    # Free pre-filters first (one DexScreener call): pure-noise liquidity,
+    # and real buyers who never once managed to sell -- one of the
+    # strongest honeypot tells there is.
+    early_pool_info = fetch_market(token_address)
     if early_pool_info["liquidity_usd"] < NOISE_LIQUIDITY_USD:
         return  # pure noise, not even worth logging as a near-miss
     if early_pool_info["buys24h"] >= MIN_BUY_SAMPLE_FOR_HONEYPOT_SIGNAL and early_pool_info["sells24h"] == 0:
@@ -444,117 +470,81 @@ def process_candidate(token_address: str, source: str = "profile"):
         )
         return
 
-    result = check_refraction(token_address)
-    token_address = result["address"]  # use the checksummed form from here on, for consistent display/logging
+    # Staged evaluation (structure -> autonomy -> payout proof -> cheap
+    # score -> fraud checks only if promising -> final score).
+    ev = evaluate_candidate(token_address, pool=early_pool_info)
+    result, sc = ev["result"], ev["score"]
+    token_address = ev["address"]  # checksummed form from here on
+    if ((result["detail"].get("payouts") or {}).get("proof")) == "unknown":
+        # The RPC couldn't serve the log scan -- that's "couldn't check",
+        # not "checked and clean". Don't cache it for a week.
+        r.set(seen_key, "1", ex=3600)
     dex_url = f"https://dexscreener.com/base/{token_address}"
-    source_tag = " (via movers scan)" if source == "mover" else ""
+    source_tag = {"mover": " (via movers scan)", "search": " (via discovery scan)"}.get(source, "")
 
     if not result["passes_all"]:
-        active_gates = set(result["gates_active"])
-        required_passed = sum(1 for k in active_gates if result["steps"].get(k))
-        if required_passed >= 1:
-            log_candidate(token_address, result, "near_miss", source=source)
-        return  # no immediate alert -- near-misses surface in the twice-daily digest / !rlog instead
+        # Log only when there is a real reward-mechanism signal. The old
+        # rule ("passed at least one required gate") logged every token,
+        # because vault_supply_safe is trivially true for anything that
+        # isn't an ERC-4626 vault.
+        if has_reward_signal(result):
+            log_candidate(token_address, ev, "near_miss", source=source)
+        return  # no immediate alert -- near-misses surface in the digest / !rlog / !mlog / !dlog
 
-    log.info("Refraction pass: %s", token_address)
-    log_candidate(token_address, result, "pass", source=source)
+    log.info("Refraction pass: %s (score %s)", token_address, sc["score"])
+    log_candidate(token_address, ev, "pass", source=source)
+    card = "\n".join(format_scorecard(ev))
     step_summary = format_step_summary(result)
+    body = f"{step_summary}\n{card}\n{dex_url}"
+
+    if not sc["buy_eligible"]:
+        notify_all(
+            f"🔍 Refraction pass on `{token_address}`{source_tag} — NOT buying.\n{body}"
+        )
+        return
 
     if not is_buy_enabled():
         notify_all(
-            f"🔍 Refraction pass on `{token_address}`{source_tag} — buying is currently paused "
-            f"(`!rbuy base on` to resume) — not spending further checks on it.\n{step_summary}\n{dex_url}"
+            f"🔍 Refraction pass on `{token_address}`{source_tag} is buy-eligible but buying is paused "
+            f"(`!rbuy base on` to resume).\n{body}"
         )
         return
 
     if buys_today() >= MAX_BUYS_PER_DAY:
         notify_all(
-            f"🔍 Refraction pass on `{token_address}`{source_tag} but daily buy cap ({MAX_BUYS_PER_DAY}) "
-            f"reached — not buying.\n{step_summary}\n{dex_url}"
+            f"🔍 Refraction pass on `{token_address}`{source_tag} is buy-eligible but the daily buy cap "
+            f"({MAX_BUYS_PER_DAY}) is reached — not buying.\n{body}"
         )
         return
 
-    # Re-check fresh rather than reuse early_pool_info -- check_refraction()
-    # takes real time (several RPC calls), and liquidity is exactly the
-    # kind of thing worth re-verifying right before a buy rather than
-    # trusting a reading from a minute ago.
-    pool_info = get_pool_info(token_address)
+    # Liquidity is exactly the kind of thing worth re-verifying right
+    # before real money moves, rather than trusting the earlier reading.
+    pool_info = fetch_market(token_address)
     liquidity = pool_info["liquidity_usd"]
     if liquidity < MIN_LIQUIDITY_USD:
         notify_all(
-            f"🔍 Refraction pass on `{token_address}`{source_tag} but liquidity (${liquidity:,.0f}) "
-            f"below floor (${MIN_LIQUIDITY_USD:,.0f}) — not buying.\n{step_summary}\n{dex_url}"
+            f"🔍 Refraction pass on `{token_address}`{source_tag} but liquidity just fell to ${liquidity:,.0f} "
+            f"(floor ${MIN_LIQUIDITY_USD:,.0f}) — not buying.\n{body}"
         )
         return
 
-    tax_note = ""
-    if REQUIRE_ZERO_TAX:
-        pool_address = pool_info["pool_address"]
-        if not pool_address:
-            notify_all(
-                f"🔍 Refraction pass on `{token_address}`{source_tag} but no pool address found for the "
-                f"tax check — not buying.\n{step_summary}\n{dex_url}"
-            )
-            return
-        tax = check_transfer_tax(token_address, pool_address)
-        if not tax["ok"]:
-            notify_all(
-                f"🔍 Refraction pass on `{token_address}`{source_tag} but the tax check was inconclusive "
-                f"({tax['reason']}) — not buying. If this keeps happening, RPC_URL likely "
-                f"doesn't support eth_call state overrides; point it at a provider that "
-                f"does.\n{step_summary}\n{dex_url}"
-            )
-            return
-        if not tax["is_zero_tax"]:
-            notify_all(
-                f"🔍 Refraction pass on `{token_address}`{source_tag} but a transfer tax was detected "
-                f"(~{tax['tax_pct']:.2f}%) — not buying.\n{step_summary}\n{dex_url}"
-            )
-            return
-        tax_note = " | tax: 0% confirmed"
-
-    if REQUIRE_HONEYPOT_SAFE:
-        honeypot = check_honeypot(token_address)
-        if not honeypot["ok"]:
-            notify_all(
-                f"🔍 Refraction pass on `{token_address}`{source_tag} but the GoPlus honeypot check was "
-                f"inconclusive ({honeypot['reason']}) — not buying.\n{step_summary}\n{dex_url}"
-            )
-            return
-        if not honeypot["is_safe"]:
-            notify_all(
-                f"🔍 Refraction pass on `{token_address}`{source_tag} but GoPlus said: "
-                f"{honeypot['reason']} — not buying.\n{step_summary}\n{dex_url}"
-            )
-            return
-        tax_note += " | GoPlus: clean"
-
-    if REQUIRE_HONEYPOT_IS_SAFE:
-        honeypot_is = check_honeypot_is(token_address)
-        if not honeypot_is["ok"]:
-            notify_all(
-                f"🔍 Refraction pass on `{token_address}`{source_tag} but the honeypot.is check errored "
-                f"({honeypot_is['reason']}) — not buying.\n{step_summary}\n{dex_url}"
-            )
-            return
-        if not honeypot_is["is_safe"]:
-            notify_all(
-                f"🔍 Refraction pass on `{token_address}`{source_tag} but honeypot.is said: "
-                f"{honeypot_is['reason']} — not buying.\n{step_summary}\n{dex_url}"
-            )
-            return
-        tax_note += " | honeypot.is: clean"
-
     if execute_buy is None:
         notify_all(
-            f"🔍 Refraction pass on `{token_address}`{source_tag} (liquidity ${liquidity:,.0f}{tax_note}) — "
-            f"execute_buy not wired up yet, buy skipped.\n{step_summary}\n{dex_url}"
+            f"🔍 Refraction pass on `{token_address}`{source_tag} (liquidity ${liquidity:,.0f}) — "
+            f"execute_buy not wired up yet, buy skipped.\n{body}"
         )
         return
 
     try:
         buy_result = asyncio.run(execute_buy(token_address, BUY_USD))
         increment_daily_count()
+
+        # Snapshot what we bought and who held which levers, so the
+        # position watcher can alert if any of it changes.
+        try:
+            save_position(r, make_snapshot(result, pool_info, sc, BUY_USD, source))
+        except Exception as e:
+            log.error("Could not save position snapshot for %s: %s", token_address, e)
 
         test_sell = buy_result.get("test_sell") or {}
         if test_sell.get("attempted") and test_sell.get("ok") is False:
@@ -563,7 +553,7 @@ def process_candidate(token_address: str, source: str = "profile"):
             # failure, then the breaker takes over from here.
             notify_all(
                 f"⚠️ Bought `{token_address}`{source_tag} but the immediate test-sell FAILED: "
-                f"{test_sell.get('reason')}\n{step_summary}\n{dex_url}"
+                f"{test_sell.get('reason')}\n{body}"
             )
             trip_circuit_breaker(
                 f"Test-sell failed on `{token_address}` after a real buy: {test_sell.get('reason')}",
@@ -573,12 +563,36 @@ def process_candidate(token_address: str, source: str = "profile"):
 
         test_sell_note = " | test-sell: confirmed sellable" if test_sell.get("ok") else ""
         notify_all(
-            f"✅ Bought ${BUY_USD:.0f} of `{token_address}`{source_tag} (liquidity ${liquidity:,.0f}{tax_note}{test_sell_note}). "
-            f"tx: {buy_result.get('tx_hash', 'n/a')}\n{step_summary}\n{dex_url}"
+            f"✅ Bought ${BUY_USD:.0f} of `{token_address}`{source_tag} (liquidity ${liquidity:,.0f}{test_sell_note}). "
+            f"tx: {buy_result.get('tx_hash', 'n/a')}\n{body}"
         )
     except Exception as e:
         log.error("Buy failed for %s: %s", token_address, e)
         notify_all(f"⚠️ Buy failed for `{token_address}`{source_tag}: {e}")
+
+
+def maybe_run_discovery_scan():
+    """Keyword search + established-active pools + trending, about once a
+    day. Reuses process_candidate() so the same dedup, staging and logging
+    apply; results land in !dlog."""
+    last = r.get(LAST_DISCOVERY_KEY)
+    now = time.time()
+    if last is not None and now - float(last) < DISCOVERY_INTERVAL_SECONDS:
+        return
+    r.set(LAST_DISCOVERY_KEY, str(now))
+    found = discover(max_candidates=DISCOVERY_MAX_CANDIDATES)
+    log.info("Discovery scan: %d candidate(s) from search / established / trending", len(found))
+    for c in found:
+        process_candidate(c["token_address"], source="search")
+
+
+def maybe_watch_positions():
+    last = r.get(LAST_WATCH_KEY)
+    now = time.time()
+    if last is not None and now - float(last) < WATCH_INTERVAL_SECONDS:
+        return
+    r.set(LAST_WATCH_KEY, str(now))
+    watch_positions(r, fetch_market, notify_all)
 
 
 def run():
@@ -593,9 +607,14 @@ def run():
                 for profile in fetch_new_base_profiles():
                     process_candidate(profile["tokenAddress"])
                 maybe_run_mover_scan()
+                maybe_run_discovery_scan()
                 maybe_send_digest()
         except Exception as e:
             log.error("Scan loop error: %s", e)
+        try:
+            maybe_watch_positions()  # runs even while scanning is paused: held tokens still need watching
+        except Exception as e:
+            log.error("Position watch error: %s", e)
         time.sleep(POLL_INTERVAL)
 
 
